@@ -9,8 +9,10 @@ handlers run at least once, every commit is fenced, and re-running is the repair
 There is no extra server to run, no step history to replay and no determinism
 requirement on your code.
 
-> **Status: pre-release, private.** The API can still change and the package is
-> not published. See [Status](#status) for what has actually been exercised.
+> **Early release.** The API can still change and nothing is on npm yet. The code
+> has a full test suite, including a real Firestore emulator, and has run in a
+> staging environment, but it has not run in production yet. Use it with that in
+> mind, and read [Guarantees and non-guarantees](#guarantees-and-non-guarantees).
 
 ## Why
 
@@ -18,8 +20,8 @@ Serverless backends on Firebase end up hand-writing the same patterns: a lease
 here, a "task already exists" catch there, a webhook dedupe collection, an outbox
 with a cron behind it. Each copy has slightly different rules for staleness and
 failure, and the bugs live in those differences. This package is one tested
-version of each, extracted from a production codebase that had written them 2 to
-9 times each.
+version of each, generalized from an application that had written them 2 to 9
+times each.
 
 | You need | Use |
 |---|---|
@@ -49,7 +51,8 @@ is a replay engine behind Vercel Workflow DevKit rather than a set of primitives
 ## Install
 
 Not on npm yet. It has no runtime dependencies; `firebase-admin` is a peer
-dependency used for types only, and you pass in the Firestore instance.
+dependency used for types only, and you pass in the Firestore instance. Tested on
+Node 24 and `firebase-admin` 14 only.
 
 ## Primitives
 
@@ -78,6 +81,8 @@ await lease.run(userId, async (held) => {
   its own crashed attempt, while a duplicate delivery of the same attempt stays busy.
 - `field: "myLease"` keeps the lease on an existing document instead of owning one.
 - `legacy` lets it share a key with a hand-rolled lease during a rolling deploy.
+- `deleteOnRelease: true` removes the lease document on release, so no document
+  outlives a run for a key that may be deleted (a crashed holder still leaves one).
 - Expiry compares wall clocks across instances. Size `ttlMs` as the longest
   operation plus the worst clock skew, or inject `runtime.now`.
 
@@ -209,23 +214,6 @@ The library writes the TTL fields, and you configure the policies. In
 Add the same for your ledger, outbox and, with `objectTtl`, object collections.
 Without a policy nothing breaks, but those documents accumulate. Also deny client
 access to these collections in your security rules.
-
-## Status
-
-| Primitive | Unit + emulator tests | Exercised on a deployed environment |
-|---|---|---|
-| `defineLease` | Yes | Yes, staging |
-| `defineTaskQueue` | Unit | Yes, staging |
-| `defineLedger` | Unit | Not yet (`runAndRecord` has a caller; `applyOnce` has none) |
-| `defineOutbox` | Yes | Not yet |
-| `defineKeyedObject` | Yes | Yes, staging: FIFO with retries, dead letters and purge; `latest` on the happy path |
-
-Nothing here has run in production yet. Requires Node 24 and `firebase-admin` 14;
-those are the only versions tested so far.
-
-Sources currently live in an application repository and are copied here one way
-(`scripts/sync-from-app.sh`, with the commit in `SYNCED_FROM`). Until that ends,
-make library changes there.
 
 ## Development
 
