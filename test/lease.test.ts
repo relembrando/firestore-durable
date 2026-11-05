@@ -20,11 +20,12 @@ const TTL = 60_000;
 let nowMs: number;
 let tokens: number;
 
-function makeLease(extra: { field?: string; sleep?: (ms: number) => Promise<void> } = {}) {
+function makeLease(extra: { field?: string; deleteOnRelease?: boolean; sleep?: (ms: number) => Promise<void> } = {}) {
     return defineLease({
         db: fakeDb,
         at: (key: string) => fakeDb.doc(extra.field ? `stories/${key}` : `leases/${key}`),
         field: extra.field,
+        deleteOnRelease: extra.deleteOnRelease,
         ttlMs: TTL,
         runtime: {
             now: () => nowMs,
@@ -254,6 +255,79 @@ describe("defineLease", () => {
             holdAs("leases/k", { holder: "usurper", token: "usurper-token" });
         });
         expect(store.get("leases/k")?.token).toBe("usurper-token");
+    });
+
+    describe("deleteOnRelease", () => {
+        const lease = () => makeLease({ deleteOnRelease: true });
+
+        it("holds a document while fn runs and leaves none after success or failure", async () => {
+            await lease().run("k", async () => {
+                expect(store.get("leases/k")).toMatchObject({ expiresAtMs: nowMs + TTL });
+            });
+            expect(store.has("leases/k")).toBe(false);
+
+            await expect(lease().run("k", async () => {
+                throw new Error("boom");
+            })).rejects.toThrow("boom");
+            expect(store.has("leases/k")).toBe(false);
+        });
+
+        it("still excludes a second acquirer while held", async () => {
+            await lease().run("k", async () => {
+                await expect(lease().run("k", async () => "second")).rejects.toThrow(LeaseBusyError);
+            });
+        });
+
+        it("a busy acquire writes nothing", async () => {
+            holdAs("leases/k", {});
+            const before = store.get("leases/k");
+            await expect(lease().run("k", async () => "second")).rejects.toThrow(LeaseBusyError);
+            expect(store.get("leases/k")).toEqual(before);
+        });
+
+        it("never deletes a lease another acquisition holds by the time it releases", async () => {
+            await lease().run("k", async () => {
+                holdAs("leases/k", { holder: "usurper", token: "usurper-token" });
+            });
+            expect(store.get("leases/k")?.token).toBe("usurper-token");
+        });
+
+        it("replaces and then removes a free document left by a keeping release", async () => {
+            store.set("leases/k", { holder: null });
+            await expect(lease().run("k", async () => "ok")).resolves.toBe("ok");
+            expect(store.has("leases/k")).toBe(false);
+        });
+
+        it("a failed release leaves an expiring document (the crash residual)", async () => {
+            let calls = 0;
+            const db = {
+                ...fakeDb,
+                doc: fakeDb.doc,
+                runTransaction: (fn: any) => {
+                    calls++;
+                    return calls === 1
+                        ? fakeDb.runTransaction(fn)
+                        : Promise.reject(new Error("release failed"));
+                },
+            };
+            const crashing = defineLease({
+                db: db as any,
+                at: (key: string) => fakeDb.doc(`leases/${key}`),
+                deleteOnRelease: true,
+                ttlMs: TTL,
+                runtime: { now: () => nowMs, newToken: () => `t${tokens++}` },
+            });
+            await expect(crashing.run("k", async () => "ok")).resolves.toBe("ok");
+            expect(store.get("leases/k")).toMatchObject({ expiresAtMs: nowMs + TTL });
+
+            nowMs += TTL + 1;
+            await expect(lease().run("k", async () => "next")).resolves.toBe("next");
+            expect(store.has("leases/k")).toBe(false);
+        });
+
+        it("refuses field mode, whose document is not the lease's to delete", () => {
+            expect(() => makeLease({ deleteOnRelease: true, field: "lease" })).toThrow(/document mode/);
+        });
     });
 
     describe("field mode (lease on an existing domain document)", () => {

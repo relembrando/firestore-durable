@@ -4,10 +4,29 @@
     "private": true,
     "description": "Durable-execution primitives for Cloud Functions, Firestore and Cloud Tasks: fenced leases, idempotent task enqueue, event ledger, transactional outbox and per-key mailboxes. Durable by convergence, not by replay.",
     "license": "Apache-2.0",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/relembrando/firestore-durable.git"
+    },
+    "keywords": [
+        "firestore",
+        "firebase",
+        "cloud-functions",
+        "cloud-tasks",
+        "durable-execution",
+        "outbox",
+        "lease",
+        "idempotency"
+    ],
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
-    "files": ["dist", "NOTICE"],
-    "engines": { "node": ">=24" },
+    "files": [
+        "dist",
+        "NOTICE"
+    ],
+    "engines": {
+        "node": ">=24"
+    },
     "scripts": {
         "build": "tsc -p tsconfig.build.json",
         "typecheck": "tsc --noEmit -p tsconfig.json",
@@ -15,7 +34,9 @@
         "test:emulator": "firebase emulators:exec --project demo-firestore-durable --only firestore 'jest --config jest.emulator.config.js --runInBand'",
         "check": "npm run typecheck && npm run build && npm test && npm run test:emulator"
     },
-    "peerDependencies": { "firebase-admin": "^14.5.0" },
+    "peerDependencies": {
+        "firebase-admin": "^14.5.0"
+    },
     "devDependencies": {
         "@swc/core": "^1.16.21",
         "@swc/jest": "^0.2.39",

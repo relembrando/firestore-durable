@@ -7,8 +7,8 @@ import type {
 /**
  * Once-only markers for external events (webhook deliveries, inbound
  * messages): one document per event id records that the event was handled, and
- * a redelivery that finds it is reported as a duplicate. Two modes, because the
- * app has two honest shapes of "exactly once":
+ * a redelivery that finds it is reported as a duplicate. Two modes, because there are
+ * two honest shapes of "exactly once":
  *
  * - {@link Ledger.applyOnce}: the event's whole effect is Firestore writes that
  *   fit in ONE transaction. The marker is created in that same transaction, so

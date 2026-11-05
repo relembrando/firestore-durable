@@ -42,6 +42,12 @@ import type {
  *   deploy old and new code hold the SAME key, so the new code must honour the
  *   old shape as busy and keep writing it alongside its own. Drop `legacy`
  *   once no deployed code reads the old shape.
+ * - Release keeps the document with a null holder, one shape for "free" whatever
+ *   the history. With `deleteOnRelease` it deletes the document instead, for a key
+ *   that names a person or anything else that should not outlive its use: a
+ *   document then exists only while an acquisition runs, or after a holder
+ *   crashed (release is best effort). A missing document is free everywhere, so
+ *   mixed releases still exclude each other.
  */
 
 /** What a lease document (or lease field) stores while held. */
@@ -64,7 +70,9 @@ export interface LeaseOwner {
  * the field value in `field` mode) and returns a live-looking legacy holder,
  * which blocks acquisition until it expires and can never be taken over or
  * fenced through. `write` returns the legacy fields to store next to the
- * lease (called with `null` on release) so the old code sees it as held.
+ * lease (called with `null` on release) so the old code sees it as held. With
+ * `deleteOnRelease` the release writes nothing, so the old code must read a
+ * missing document as free.
  */
 export interface LegacyLeaseFormat {
     read: (raw: unknown) => { holder: string; expiresAtMs: number } | undefined;
@@ -90,6 +98,8 @@ export interface LeaseConfig<K> {
      */
     field?: string;
     ttlMs: number;
+    /** Release deletes the document. Document mode only: a `field` lease does not own its document. */
+    deleteOnRelease?: boolean;
     legacy?: LegacyLeaseFormat;
     runtime?: Partial<LeaseRuntime>;
 }
@@ -167,9 +177,12 @@ function decode(raw: unknown): LeaseState | undefined {
 }
 
 export function defineLease<K>(config: LeaseConfig<K>): Lease<K> {
-    const { db, at, field, ttlMs, legacy } = config;
+    const { db, at, field, ttlMs, legacy, deleteOnRelease } = config;
     if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
         throw new Error(`defineLease: ttlMs must be a positive number, got ${ttlMs}`);
+    }
+    if (deleteOnRelease && field !== undefined) {
+        throw new Error("defineLease: deleteOnRelease needs document mode, a field lease does not own its document");
     }
     const runtime: LeaseRuntime = { ...defaultRuntime, ...config.runtime };
 
@@ -182,8 +195,6 @@ export function defineLease<K>(config: LeaseConfig<K>): Lease<K> {
     const write = (tx: Transaction, ref: DocumentReference, state: LeaseState | null): void => {
         const extra = legacy?.write(state) ?? {};
         if (field === undefined) {
-            // Release keeps the document with a null holder rather than
-            // deleting it: one shape for "free", whatever the history.
             tx.set(ref, { ...(state ?? { holder: null }), ...extra });
         } else {
             const hasExtra = Object.keys(extra).length > 0;
@@ -217,7 +228,8 @@ export function defineLease<K>(config: LeaseConfig<K>): Lease<K> {
         await db.runTransaction(async (tx) => {
             const snap = await tx.get(ref);
             if (!snap.exists || read(snap)?.token !== token) return;
-            write(tx, ref, null);
+            if (deleteOnRelease) tx.delete(ref);
+            else write(tx, ref, null);
         });
     }
 
