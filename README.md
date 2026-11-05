@@ -10,7 +10,7 @@ There is no extra server to run, no step history to replay and no determinism
 requirement on your code.
 
 > **Early release.** The API can still change and nothing is on npm yet. The code
-> has a full test suite, including a real Firestore emulator, and has run in a
+> has a full test suite, including a real Firestore emulator, and most of it has run in a
 > staging environment, but it has not run in production yet. Use it with that in
 > mind, and read [Guarantees and non-guarantees](#guarantees-and-non-guarantees).
 
