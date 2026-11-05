@@ -1,0 +1,7 @@
+rules_version = '2';
+// The library only writes through the Admin SDK, which bypasses rules.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} { allow read, write: if false; }
+  }
+}
