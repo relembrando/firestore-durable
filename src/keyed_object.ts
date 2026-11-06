@@ -101,6 +101,8 @@ import type { TaskQueue } from "./task_queue";
  *   kicks use a time window of `olderThanMs`, so runs inside one window coalesce;
  *   a refused kick costs one more run, because the next window's id is new. A
  *   stray document with no object costs one no-op drain per window until its TTL.
+ *   `limit` bounds one call: follow `next` to reach every key, since keys that
+ *   stay pending would otherwise hide the ones behind them.
  * - What liveness does not cover: a worker down past `inboxTtl` loses the
  *   messages (the TTL deletes them, and the sweep sees nothing), and `onExpired`
  *   reports that only on the key's next drain, which takes a later send.
@@ -241,6 +243,8 @@ export interface KeyedSweepOptions {
     olderThanMs: number;
     /** Keys examined per call, one read each; also bounds the kicks. */
     limit: number;
+    /** Continue after this key: the `next` of the previous call. */
+    after?: string;
 }
 
 export interface KeyedSweepResult {
@@ -258,8 +262,12 @@ export interface KeyedSweepResult {
     failed: number;
     /** The first enqueue failure, when any. */
     error?: string;
-    /** `limit` was reached with keys left, which then wait for the ones ahead to clear. */
-    truncated: boolean;
+    /**
+     * `limit` was reached with keys left: pass this as `after` to reach them.
+     * Restarting from the top instead revisits the same keys, and a key behind them
+     * waits for as long as they stay pending.
+     */
+    next?: string;
 }
 
 export interface KeyedObject<M, S> {
@@ -622,12 +630,12 @@ export function defineKeyedObject<M, S = DocumentData>(config: KeyedObjectConfig
             return deleted;
         },
 
-        async sweep({ olderThanMs, limit }) {
+        async sweep({ olderThanMs, limit, after }) {
             positive("olderThanMs", olderThanMs);
             if (!Number.isInteger(limit) || limit < 1) {
                 throw new Error(`defineKeyedObject: limit must be a positive integer, got ${limit}`);
             }
-            const result: KeyedSweepResult = { scanned: 0, rekicked: 0, coalesced: 0, backingOff: 0, recent: 0, failed: 0, truncated: false };
+            const result: KeyedSweepResult = { scanned: 0, rekicked: 0, coalesced: 0, backingOff: 0, recent: 0, failed: 0 };
             const nowMs = runtime.now();
             const heads = db
                 .collectionGroup(MAILBOX)
@@ -635,14 +643,17 @@ export function defineKeyedObject<M, S = DocumentData>(config: KeyedObjectConfig
                 .endBefore(`${name}/${ID_MAX}`)
                 .select("createdAt", "notBefore", "startedAt")
                 .limit(1);
-            let cursor = `${name}/${ID_MIN}`;
+            const pastKey = (key: string) => `${name}/${key}/${MAILBOX}/${ID_MAX}`;
+            let cursor = after === undefined ? `${name}/${ID_MIN}` : pastKey(after);
+            let lastKey = after;
             for (;;) {
                 const [head] = (await heads.startAfter(cursor).get()).docs;
                 if (!head) return result;
-                if (result.scanned >= limit) return { ...result, truncated: true };
+                if (result.scanned >= limit) return { ...result, next: lastKey };
                 result.scanned++;
                 const key = head.ref.path.split("/")[1];
-                cursor = `${name}/${key}/${MAILBOX}/${ID_MAX}`;
+                lastKey = key;
+                cursor = pastKey(key);
 
                 const notBeforeMs = toMillis(head.get("notBefore"));
                 if (notBeforeMs > nowMs) {

@@ -177,9 +177,11 @@ await conversations.drain(key, async (ctx, msg) => {
 - **Ordering:** `seq` follows `send` commit order, not the provider's timestamp.
 - **Failure:** a failing head blocks its key, with backoff, until it succeeds or
   moves to the dead-letter collection. Other keys are not affected.
-- **Lost kicks:** call `sweep({ olderThanMs, limit })` on a schedule. It re-kicks a
-  key whose oldest pending message saw no activity for `olderThanMs`, which you keep
-  above `leaseMs`. Without it, a key that lost every kick waits for its next send.
+- **Lost kicks:** call `sweep({ olderThanMs, limit, after })` on a schedule. It re-kicks
+  a key whose oldest pending message saw no activity for `olderThanMs`, which you keep
+  above `leaseMs`. Follow `next` into `after` until it is absent, or keys that stay
+  pending hide the ones behind them. Without a sweep, a key that lost every kick waits
+  for its next send.
 - **Budget one drain per task** if a handler can take close to the worker's timeout.
 - **Erasure:** set `objectTtl` to enable `purge(key)` and let idle objects expire.
 - **Personal data:** the key is stored as a document id and messages are stored as

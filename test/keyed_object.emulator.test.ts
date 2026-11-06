@@ -514,14 +514,17 @@ describe("defineKeyedObject against the Firestore emulator", () => {
             await lost(prefix.object, "elsewhere");
             for (const o of [big, small, prefix]) o.tick(SWEEP.olderThanMs);
 
-            expect(await big.object.sweep({ ...SWEEP, limit: 5 })).toMatchObject({ scanned: 5, rekicked: 5, truncated: true });
-            expect(await small.object.sweep({ ...SWEEP, limit: 5 })).toMatchObject({ scanned: 1, rekicked: 1, truncated: false });
+            expect(await big.object.sweep({ ...SWEEP, limit: 5 })).toMatchObject({ scanned: 5, rekicked: 5, next: "key04" });
+            expect(await small.object.sweep({ ...SWEEP, limit: 5 })).toEqual({ scanned: 1, rekicked: 1, coalesced: 0, backingOff: 0, recent: 0, failed: 0 });
             expect(small.kicks.map((k) => k.key)).toEqual(["only"]);
             // The range stops at the name: a longer collection name is another object.
             expect(await prefix.object.sweep({ ...SWEEP, limit: 5 })).toMatchObject({ scanned: 1, rekicked: 1 });
             expect(prefix.kicks.map((k) => k.key)).toEqual(["elsewhere"]);
             // The key with 301 messages took one read: all five kicks are distinct keys.
             expect(big.kicks.map((k) => k.key)).toEqual(["key00", "key01", "key02", "key03", "key04"]);
+            // `after` resumes past that key on a real query.
+            expect(await big.object.sweep({ ...SWEEP, limit: 5, after: "key04" })).toMatchObject({ scanned: 5, next: "key09" });
+            expect(big.kicks.slice(5).map((k) => k.key)).toEqual(["key05", "key06", "key07", "key08", "key09"]);
         });
 
         it("finds any key the document id allows, whatever its first character", async () => {

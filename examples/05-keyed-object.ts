@@ -68,8 +68,12 @@ export const drainConversation = onTaskDispatched<KeyedObjectKick>(async (reques
 
 // Backstop for lost kicks. Keep olderThanMs above leaseMs, and the period at or below it.
 export const sweepConversations = onSchedule("every 5 minutes", async () => {
-    const { failed, error } = await conversations.sweep({ olderThanMs: 5 * 60 * 1000, limit: 500 });
-    if (failed) logger.error("conversation sweep had failures", { failed, error });
+    let after: string | undefined;
+    do {
+        const page = await conversations.sweep({ olderThanMs: 5 * 60 * 1000, limit: 200, after });
+        if (page.failed) logger.error("conversation sweep had failures", { failed: page.failed, error: page.error });
+        after = page.next;
+    } while (after);
 });
 
 // Erasure: deletes the object, its messages, markers and dead letters.

@@ -67,7 +67,7 @@ function make(mode: KeyedObjectMode = "fifo", extra: Partial<KeyedObjectConfig<M
 const noop: KeyedHandler<Msg, State> = async () => undefined;
 
 const SWEEP = { olderThanMs: 15 * 60 * 1000, limit: 100 };
-const EMPTY = { scanned: 0, rekicked: 0, coalesced: 0, backingOff: 0, recent: 0, failed: 0, truncated: false };
+const EMPTY = { scanned: 0, rekicked: 0, coalesced: 0, backingOff: 0, recent: 0, failed: 0 };
 /** The id a sweep kick must produce now: a time window, not `"forever"`. */
 const sweepId = (key: string) =>
     taskIdFor({ prefix: "objects", key: `${key}\nsweep`, window: { seconds: SWEEP.olderThanMs / 1000 } }, clock);
@@ -1295,12 +1295,12 @@ describe("sweep", () => {
             expect(tasks.map((t) => t.key)).toEqual(["a", "b"]);
         });
 
-        it("stops at `limit` keys and says so; kicked keys clear, so the next run reaches the rest", async () => {
+        it("stops at `limit` keys and names where to continue", async () => {
             const obj = make();
             for (const key of ["a", "b", "c"]) await pending(obj, key);
             clock += SWEEP.olderThanMs;
 
-            expect(await obj.sweep({ ...SWEEP, limit: 2 })).toEqual({ ...EMPTY, scanned: 2, rekicked: 2, truncated: true });
+            expect(await obj.sweep({ ...SWEEP, limit: 2 })).toEqual({ ...EMPTY, scanned: 2, rekicked: 2, next: "b" });
             expect(tasks.map((t) => t.key)).toEqual(["a", "b"]);
             await obj.drain("a", noop);
             await obj.drain("b", noop);
@@ -1310,7 +1310,19 @@ describe("sweep", () => {
             expect(tasks.map((t) => t.key)).toEqual(["a", "b", "c"]);
         });
 
-        it("is not truncated when `limit` is exactly the number of keys", async () => {
+        it("`after` reaches a stranded key behind one that stays pending", async () => {
+            const obj = make();
+            await pending(obj, "z");
+            clock += SWEEP.olderThanMs;
+            await pending(obj, "a"); // recent, so it is not kicked and does not clear
+
+            expect(await obj.sweep({ ...SWEEP, limit: 1 })).toEqual({ ...EMPTY, scanned: 1, recent: 1, next: "a" });
+            expect(tasks).toEqual([]);
+            expect(await obj.sweep({ ...SWEEP, limit: 1, after: "a" })).toEqual({ ...EMPTY, scanned: 1, rekicked: 1 });
+            expect(tasks.map((t) => t.key)).toEqual(["z"]);
+        });
+
+        it("has no `next` when `limit` is exactly the number of keys", async () => {
             const obj = make();
             await pending(obj, "a");
             clock += SWEEP.olderThanMs;
