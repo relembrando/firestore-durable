@@ -4,6 +4,7 @@ import { FieldValue, getFirestore } from "firebase-admin/firestore";
 import { getFunctions } from "firebase-admin/functions";
 import { logger } from "firebase-functions";
 import { onRequest, onCall } from "firebase-functions/v2/https";
+import { onSchedule } from "firebase-functions/v2/scheduler";
 import { onTaskDispatched } from "firebase-functions/v2/tasks";
 import { defineKeyedObject, defineTaskQueue } from "../src";
 import type { KeyedObjectKick } from "../src";
@@ -63,6 +64,12 @@ export const drainConversation = onTaskDispatched<KeyedObjectKick>(async (reques
         },
         { owner: { id: request.id, epoch: request.retryCount } },
     );
+});
+
+// Backstop for lost kicks. Keep olderThanMs above leaseMs, and the period at or below it.
+export const sweepConversations = onSchedule("every 5 minutes", async () => {
+    const { failed, error } = await conversations.sweep({ olderThanMs: 5 * 60 * 1000, limit: 500 });
+    if (failed) logger.error("conversation sweep had failures", { failed, error });
 });
 
 // Erasure: deletes the object, its messages, markers and dead letters.

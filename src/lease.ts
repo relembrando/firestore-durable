@@ -41,7 +41,9 @@ import type {
  * - Adopting a hand-rolled lease ({@link LegacyLeaseFormat}): during a rolling
  *   deploy old and new code hold the SAME key, so the new code must honour the
  *   old shape as busy and keep writing it alongside its own. Drop `legacy`
- *   once no deployed code reads the old shape.
+ *   once no deployed code reads the old shape. The old shape is consulted
+ *   whenever the modern lease is not live, whatever the old code left of it. A
+ *   live modern lease needs no check: its own legacy fields keep old code out.
  * - Release keeps the document with a null holder, one shape for "free" whatever
  *   the history. With `deleteOnRelease` it deletes the document instead, for a key
  *   that names a person or anything else that should not outlive its use: a
@@ -67,12 +69,15 @@ export interface LeaseOwner {
 /**
  * The shape a replaced implementation stored, so both can share one key while
  * a deploy rolls out. `read` gets the raw lease value (the document data, or
- * the field value in `field` mode) and returns a live-looking legacy holder,
- * which blocks acquisition until it expires and can never be taken over or
- * fenced through. `write` returns the legacy fields to store next to the
- * lease (called with `null` on release) so the old code sees it as held. With
+ * the field value in `field` mode), which may also hold an expired modern lease,
+ * and returns a live-looking legacy holder, which blocks acquisition until it
+ * expires and can never be taken over or fenced through. `write` returns the
+ * legacy fields to store next to the lease (called with `null` on release) so
+ * the old code sees it as held. With
  * `deleteOnRelease` the release writes nothing, so the old code must read a
- * missing document as free.
+ * missing document as free. Do not adopt an `update`-based legacy writer: it
+ * keeps a modern `token` beside its own hold, so a late modern holder's fence
+ * still passes.
  */
 export interface LegacyLeaseFormat {
     read: (raw: unknown) => { holder: string; expiresAtMs: number } | undefined;
@@ -215,7 +220,9 @@ export function defineLease<K>(config: LeaseConfig<K>): Lease<K> {
             if (held && isLive(held.expiresAtMs, nowMs)) {
                 const retryOfHolder = held.holder === owner.id && owner.epoch > held.epoch;
                 if (!retryOfHolder) return { acquired: false as const, holder: held.holder };
-            } else if (!held && legacy) {
+            } else if (legacy) {
+                // Not only with no modern lease: a legacy writer using `update` or
+                // merge keeps the fields of the expired lease it acquired over.
                 const old = legacy.read(rawOf(snap));
                 if (old && isLive(old.expiresAtMs, nowMs)) return { acquired: false as const, holder: old.holder };
             }

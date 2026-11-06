@@ -9,15 +9,17 @@
  * `ctx.tx`, dead letters, and `latest` supersession.
  */
 
-import { FieldValue, getFirestore } from "firebase-admin/firestore";
+import { FieldValue, getFirestore, Query } from "firebase-admin/firestore";
+import type { QuerySnapshot } from "firebase-admin/firestore";
 import { setTimeout as sleep } from "timers/promises";
-import { defineKeyedObject, defineTaskQueue, LeaseLostError } from "../src";
+import { defineKeyedObject, defineTaskQueue, LeaseLostError, taskIdFor } from "../src";
 import type { KeyedDeadLetter, KeyedHandler, KeyedObjectConfig, KeyedObjectKick, KeyedObjectMode } from "../src";
 
 const db = getFirestore();
 const LEASE = 60_000;
 /** Upper bound on one held handler, so a stuck drain cannot hang the suite. */
 const HOLD_DEADLINE_MS = 5_000;
+const SWEEP = { olderThanMs: 15 * 60 * 1000, limit: 100 };
 
 type Msg = { n: number };
 type State = { count?: number; by?: string };
@@ -313,5 +315,284 @@ describe("defineKeyedObject against the Firestore emulator", () => {
         expect(result).toEqual({ outcome: "idle", processed: 2, deadLettered: 0 });
         expect(await counters("k")).toMatchObject({ lastSeq: 4, processedSeq: 4 });
         expect(await mailbox("k")).toEqual([]);
+    });
+
+    describe("objectTtl", () => {
+        const objectTtl = { ms: 3 * 86_400_000 };
+
+        /** One object per instance, all kicking into one Cloud Tasks stand-in, each with its own clock. */
+        function instances(mode: KeyedObjectMode = "fifo") {
+            const { queue, kicks } = fakeQueue();
+            const at = (nowMs: number) =>
+                defineKeyedObject<Msg, State>({
+                    db,
+                    name: "objects",
+                    mode,
+                    queue,
+                    leaseMs: LEASE,
+                    maxAttempts: 3,
+                    backoff: { baseMs: 1, maxMs: 1 },
+                    inboxTtl: { field: "expiresAt", ms: 86_400_000 },
+                    objectTtl,
+                    drainBudget: { messages: 100, ms: 60_000 },
+                    deleteField: () => FieldValue.delete(),
+                    runtime: { now: () => nowMs },
+                });
+            return { at, kicks };
+        }
+
+        it("a restart whose clock is behind repeats seqs: their kicks are refused, and the sweep recovers them", async () => {
+            const { at, kicks } = instances();
+            const nowMs = Date.now();
+            const ahead = at(nowMs);
+            for (const n of [1, 2, 3]) await ahead.send("k", { n }, { id: `a${n}` });
+            await ahead.drain("k", async () => undefined);
+            await ahead.purge("k");
+            expect(kicks).toHaveLength(3);
+
+            const behind = at(nowMs - 1);
+            for (const n of [1, 2, 3, 4]) expect(await behind.send("k", { n }, { id: `b${n}` })).toBe("accepted");
+
+            // Seqs nowMs..nowMs+3 reuse the first generation's nowMs+1..nowMs+3: one new id, three refused.
+            expect(await counters("k")).toMatchObject({ lastSeq: nowMs + 3, processedSeq: nowMs - 1 });
+            expect(kicks).toHaveLength(4);
+
+            // The kick that exists runs the backlog; here it is lost too, and only the sweep is left.
+            kicks.length = 0;
+            const later = at(nowMs + SWEEP.olderThanMs);
+            expect(await later.sweep(SWEEP)).toMatchObject({ scanned: 1, rekicked: 1 });
+            expect(kicks).toHaveLength(1);
+            const seen: number[] = [];
+            expect(await later.drain("k", async (_ctx, msg) => void seen.push(msg.n))).toEqual({
+                outcome: "idle", processed: 4, deadLettered: 0,
+            });
+            expect(seen).toEqual([1, 2, 3, 4]);
+        });
+
+        it("concurrent first sends get one object and one task each", async () => {
+            const { at, kicks } = instances();
+            const nowMs = Date.now();
+            const outcomes = await Promise.all(
+                Array.from({ length: 6 }, (_, n) => at(nowMs + n).send("k", { n }, { id: `m${n}` })),
+            );
+
+            expect(outcomes).toEqual(Array(6).fill("accepted"));
+            expect(new Set(kicks.map((k) => k.id)).size).toBe(6);
+            const { lastSeq, processedSeq } = await counters("k");
+            expect(lastSeq - processedSeq).toBe(6);
+            const expected = Array.from({ length: 6 }, (_, i) =>
+                taskIdFor({ prefix: "objects", key: `k\ns${processedSeq + i + 1}`, window: "forever" }, nowMs),
+            );
+            expect(kicks.map((k) => k.id).sort()).toEqual(expected.sort());
+        });
+    });
+
+    describe("a stray document at the next seq", () => {
+        it.each(["fifo", "latest"] as const)("%s: a send overwrites it instead of wedging the key", async (mode) => {
+            const { object } = newObject(mode);
+            await object.send("k", { n: 1 }, { id: "m1" });
+            const next = mode === "fifo" ? "000000000002" : "latest";
+            await db.doc(`objects/k/mailbox/${next}`).set({ seq: 99, id: "leftover", msg: { n: 99 }, attempts: 7 });
+
+            expect(await object.send("k", { n: 2 }, { id: "m2" })).toBe("accepted");
+
+            const doc = await db.doc(`objects/k/mailbox/${next}`).get();
+            expect(doc.data()).toMatchObject({ seq: 2, id: "m2", msg: { n: 2 }, attempts: 0 });
+            const seen: number[] = [];
+            await object.drain("k", async (_ctx, msg) => void seen.push(msg.n));
+            expect(seen).toEqual(mode === "fifo" ? [1, 2] : [2]);
+            expect(await mailbox("k")).toEqual([]);
+        });
+
+        it("concurrent sends over a stray still take distinct seqs and lose nothing", async () => {
+            const { object } = newObject();
+            await object.send("k", { n: 0 }, { id: "m0" });
+            await db.doc("objects/k/mailbox/000000000002").set({ seq: 99, id: "leftover", msg: { n: 99 } });
+
+            const N = 5;
+            const sent = await Promise.all(Array.from({ length: N }, (_, i) => object.send("k", { n: i + 1 }, { id: `m${i + 1}` })));
+
+            expect(sent).toEqual(Array(N).fill("accepted"));
+            expect(await counters("k")).toMatchObject({ lastSeq: N + 1 });
+            const seen: number[] = [];
+            await object.drain("k", async (_ctx, msg) => void seen.push(msg.n));
+            expect(seen.sort()).toEqual([0, 1, 2, 3, 4, 5]);
+        });
+    });
+
+    describe("sweep", () => {
+        const noop: KeyedHandler<Msg, State> = async () => undefined;
+        /** An object whose clock is the test's, with a shared stand-in queue, so a send can leave no kick. */
+        function clocked(name = "objects", extra: Partial<KeyedObjectConfig<Msg>> = {}) {
+            let clock = Date.now();
+            const { queue, kicks } = fakeQueue();
+            const object = defineKeyedObject<Msg, State>({
+                db,
+                name,
+                mode: "fifo",
+                queue,
+                leaseMs: LEASE,
+                maxAttempts: 3,
+                backoff: { baseMs: 2 * SWEEP.olderThanMs, maxMs: 2 * SWEEP.olderThanMs },
+                inboxTtl: { field: "expiresAt", ms: 86_400_000 },
+                drainBudget: { messages: 100, ms: 60_000 },
+                deleteField: () => FieldValue.delete(),
+                runtime: { now: () => clock },
+                ...extra,
+            });
+            return { object, kicks, tick: (ms: number) => void (clock += ms), now: () => clock };
+        }
+        const lost = (object: ReturnType<typeof clocked>["object"], key: string, n = 1) =>
+            object.send(key, { n }, { id: `${key}-${n}`, kick: false });
+
+        it("recovers a lost kick past the threshold, and only then", async () => {
+            const { object, kicks, tick } = clocked();
+            await lost(object, "k");
+
+            expect(await object.sweep(SWEEP)).toMatchObject({ scanned: 1, recent: 1, rekicked: 0 });
+            expect(kicks).toEqual([]);
+
+            tick(SWEEP.olderThanMs);
+            expect(await object.sweep(SWEEP)).toMatchObject({ scanned: 1, rekicked: 1 });
+            expect(kicks).toEqual([expect.objectContaining({ key: "k" })]);
+            expect(await object.drain("k", noop)).toMatchObject({ outcome: "idle", processed: 1 });
+            expect(await object.sweep(SWEEP)).toMatchObject({ scanned: 0 });
+        });
+
+        it("recovers a vanished holder once its lease expired, with no kick armed by the refused drain", async () => {
+            const { object, kicks, tick } = clocked();
+            await lost(object, "k");
+
+            // Holder dies inside the handler: the lease stays, and no platform retry follows.
+            const died = deferred();
+            const inside = deferred();
+            const holder = object.drain("k", async () => {
+                inside.resolve();
+                await died.promise;
+            });
+            await inside.promise;
+            expect((await object.drain("k", noop)).outcome).toBe("busy");
+            expect(kicks).toEqual([]);
+
+            tick(SWEEP.olderThanMs);
+            expect(await object.sweep(SWEEP)).toMatchObject({ rekicked: 1 });
+            const seen: number[] = [];
+            expect(await object.drain("k", async (ctx) => void seen.push(ctx.attempt))).toMatchObject({
+                outcome: "idle", processed: 1,
+            });
+            expect(seen).toEqual([2]);
+            died.resolve();
+            expect(await holder).toMatchObject({ outcome: "lost", processed: 0 });
+        });
+
+        it("skips a head in backoff, which keeps its due time and task", async () => {
+            const { object, kicks, tick } = clocked();
+            await object.send("k", { n: 1 }, { id: "m1" });
+            await object.drain("k", async () => { throw new Error("boom"); });
+            const before = (await db.doc("objects/k/mailbox/000000000001").get()).data();
+            const armed = [...kicks];
+
+            tick(SWEEP.olderThanMs + 1);
+            expect(await object.sweep(SWEEP)).toMatchObject({ scanned: 1, backingOff: 1, rekicked: 0 });
+
+            expect(kicks).toEqual(armed);
+            expect((await db.doc("objects/k/mailbox/000000000001").get()).data()).toEqual(before);
+        });
+
+        it("sweeps two objects sharing the group, neither starved by a large backlog in the other", async () => {
+            const big = clocked("objects");
+            const small = clocked("othersmall");
+            const prefix = clocked("objects2");
+            // More keys in `objects` than either limit, and one key with a long backlog.
+            for (let i = 0; i < 12; i++) await lost(big.object, `key${String(i).padStart(2, "0")}`);
+            const batch = db.batch();
+            for (let n = 1; n <= 300; n++) {
+                batch.set(db.doc(`objects/key00/mailbox/${String(n + 1).padStart(12, "0")}`), { seq: n + 1, msg: { n } });
+            }
+            await batch.commit();
+            await lost(small.object, "only");
+            await lost(prefix.object, "elsewhere");
+            for (const o of [big, small, prefix]) o.tick(SWEEP.olderThanMs);
+
+            expect(await big.object.sweep({ ...SWEEP, limit: 5 })).toMatchObject({ scanned: 5, rekicked: 5, truncated: true });
+            expect(await small.object.sweep({ ...SWEEP, limit: 5 })).toMatchObject({ scanned: 1, rekicked: 1, truncated: false });
+            expect(small.kicks.map((k) => k.key)).toEqual(["only"]);
+            // The range stops at the name: a longer collection name is another object.
+            expect(await prefix.object.sweep({ ...SWEEP, limit: 5 })).toMatchObject({ scanned: 1, rekicked: 1 });
+            expect(prefix.kicks.map((k) => k.key)).toEqual(["elsewhere"]);
+            // The key with 301 messages took one read: all five kicks are distinct keys.
+            expect(big.kicks.map((k) => k.key)).toEqual(["key00", "key01", "key02", "key03", "key04"]);
+        });
+
+        it("finds any key the document id allows, whatever its first character", async () => {
+            const { object, kicks, tick } = clocked();
+            for (const key of ["~tilde", "é-accent", "\u{1F600}-emoji"]) await lost(object, key);
+            tick(SWEEP.olderThanMs);
+
+            expect(await object.sweep(SWEEP)).toMatchObject({ scanned: 3, rekicked: 3 });
+            expect(kicks.map((k) => k.key).sort()).toEqual(["~tilde", "é-accent", "\u{1F600}-emoji"].sort());
+        });
+
+        it("reads only the masked fields from the backend, one document per key", async () => {
+            const { object, tick } = clocked();
+            for (const n of [1, 2, 3]) await lost(object, "a", n);
+            await lost(object, "b");
+            tick(SWEEP.olderThanMs);
+            const reads = jest.spyOn(Query.prototype, "get");
+
+            await object.sweep(SWEEP);
+
+            const snaps = await Promise.all(reads.mock.results.map((r) => r.value as Promise<QuerySnapshot>));
+            reads.mockRestore();
+            const docs = snaps.flatMap((snap) => snap.docs);
+            expect(docs.map((d) => d.ref.path.split("/")[1])).toEqual(["a", "b"]);
+            for (const doc of docs) expect(Object.keys(doc.data()).sort()).toEqual(["createdAt"]);
+        });
+    });
+
+    it("concurrent ctx.once calls with one name run the step once and journal it once", async () => {
+        const { object } = newObject();
+        await object.send("k", { n: 1 }, { id: "m1" });
+        let executions = 0;
+        const step = async () => {
+            executions++;
+            await sleep(20);
+            return { receipt: `r${executions}` };
+        };
+        let results: unknown[] = [];
+        let journal: unknown;
+
+        const result = await object.drain("k", async (ctx) => {
+            results = await Promise.all([ctx.once("charge", step), ctx.once("charge", step), ctx.once("charge", step)]);
+            journal = (await db.doc("objects/k/mailbox/000000000001").get()).get("journal");
+        });
+
+        expect(result).toMatchObject({ outcome: "idle", processed: 1 });
+        expect(executions).toBe(1);
+        expect(results).toEqual([{ receipt: "r1" }, { receipt: "r1" }, { receipt: "r1" }]);
+        expect(journal).toEqual({ charge: { json: JSON.stringify({ receipt: "r1" }) } });
+    });
+
+    it("a drain over an expired backlog stops at the time budget and re-kicks, and the next drain continues", async () => {
+        let clock = Date.now();
+        const { object, kicks } = newObject("fifo", {
+            runtime: { now: () => clock },
+            drainBudget: { messages: 100, ms: 30_000 },
+            onExpired: () => void (clock += 30_000),
+        });
+        for (const n of [1, 2, 3]) await object.send("k", { n }, { id: `m${n}` });
+        for (const id of ["000000000001", "000000000002"]) await db.doc(`objects/k/mailbox/${id}`).delete();
+        kicks.length = 0;
+        const seen: number[] = [];
+        const handler: KeyedHandler<Msg, State> = async (_ctx, msg) => void seen.push(msg.n);
+
+        expect(await object.drain("k", handler)).toEqual({ outcome: "budget", processed: 0, deadLettered: 0 });
+        expect(await counters("k")).toMatchObject({ processedSeq: 1 });
+        expect(kicks).toHaveLength(1);
+
+        expect((await object.drain("k", handler)).outcome).toBe("budget");
+        expect(await object.drain("k", handler)).toEqual({ outcome: "idle", processed: 1, deadLettered: 0 });
+        expect(kicks).toHaveLength(2);
+        expect(seen).toEqual([3]);
     });
 });

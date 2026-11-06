@@ -66,6 +66,42 @@ function make(mode: KeyedObjectMode = "fifo", extra: Partial<KeyedObjectConfig<M
 
 const noop: KeyedHandler<Msg, State> = async () => undefined;
 
+const SWEEP = { olderThanMs: 15 * 60 * 1000, limit: 100 };
+const EMPTY = { scanned: 0, rekicked: 0, coalesced: 0, backingOff: 0, recent: 0, failed: 0, truncated: false };
+/** The id a sweep kick must produce now: a time window, not `"forever"`. */
+const sweepId = (key: string) =>
+    taskIdFor({ prefix: "objects", key: `${key}\nsweep`, window: { seconds: SWEEP.olderThanMs / 1000 } }, clock);
+
+/** Records what the sweep's query chain asks for and gets back. */
+function spyReads() {
+    const masks: unknown[] = [];
+    const results: any[] = [];
+    const wrap = (query: any): any =>
+        new Proxy(query, {
+            get(target, prop) {
+                const value = target[prop];
+                if (typeof value !== "function") return value;
+                return (...args: unknown[]) => {
+                    if (prop === "select") masks.push(args);
+                    const out = value(...args);
+                    if (prop !== "get") return wrap(out);
+                    return out.then((snap: any) => {
+                        results.push(snap);
+                        return snap;
+                    });
+                };
+            },
+        });
+    const group = fakeDb.collectionGroup;
+    const spy = jest.spyOn(fakeDb, "collectionGroup").mockImplementation((...args: unknown[]) => wrap(group(...args)));
+    return {
+        masks,
+        docs: () => results.reduce((n, snap) => n + snap.size, 0),
+        fields: () => results.flatMap((snap) => snap.docs.flatMap((doc: any) => Object.keys(doc.data()))),
+        restore: () => spy.mockRestore(),
+    };
+}
+
 beforeEach(() => {
     resetStore();
     clock = NOW;
@@ -145,7 +181,7 @@ describe("send", () => {
         expect(tasks.map((t) => t.id)).toEqual([kickId("s1"), kickId("s2")]);
     });
 
-    it("a concurrent commit of the same id is a duplicate, and a stray message document stays loud", async () => {
+    it("a concurrent commit of the same id is a duplicate", async () => {
         const obj = make();
         // The id's marker is committed between this send's read and its commit.
         const original = fakeDb.runTransaction;
@@ -158,10 +194,23 @@ describe("send", () => {
         await expect(obj.send("k", { n: 1 }, { id: "m1" })).resolves.toBe("duplicate");
         spy.mockRestore();
         expect(store.get(object())).toEqual({ lastSeq: 1, processedSeq: 0 });
+    });
 
-        store.set(item(2), { stray: true });
-        await expect(obj.send("k", { n: 2 }, { id: "m2" })).rejects.toThrow(/ALREADY_EXISTS/);
-        expect(store.get(object())).toEqual({ lastSeq: 1, processedSeq: 0 });
+    it.each(["fifo", "latest"] as const)("%s: a stray document at the next seq cannot wedge the key", async (mode) => {
+        const obj = make(mode);
+        await obj.send("k", { n: 1 }, { id: "m1" });
+        const next = mode === "fifo" ? item(2) : item("latest");
+        store.set(next, { seq: 99, id: "leftover", msg: { n: 99 }, attempts: 7, notBefore: new Date(NOW + TTL), journal: { x: {} } });
+
+        expect(await obj.send("k", { n: 2 }, { id: "m2" })).toBe("accepted");
+
+        expect(store.get(next)).toEqual({
+            seq: 2, id: "m2", msg: { n: 2 }, attempts: 0, createdAt: new Date(NOW), expiresAt: new Date(NOW + TTL),
+        });
+        const seen: number[] = [];
+        expect(await obj.drain("k", async (_ctx, msg) => void seen.push(msg.n))).toMatchObject({ outcome: "idle" });
+        expect(seen).toEqual(mode === "fifo" ? [1, 2] : [2]);
+        expect(store.has(next)).toBe(false);
     });
 
     it("heals a kick that failed after the commit when the send is retried", async () => {
@@ -248,59 +297,6 @@ describe("drain", () => {
         expect(busy).toEqual({ outcome: "busy", processed: 0, deadLettered: 0 });
         expect(seen).toEqual([1, 2]);
         expect(result).toMatchObject({ outcome: "idle", processed: 2 });
-    });
-
-    it("a refused drain arms one kick past the lease, so a holder that never released cannot strand the key", async () => {
-        const obj = make();
-        await obj.send("k", { n: 1 }, { id: "m1" });
-        // A drain whose release failed: its lease stays live and no task will retry.
-        store.set(object(), {
-            ...store.get(object())!,
-            lease: { holder: "gone", epoch: 0, token: "t", expiresAtMs: NOW + LEASE },
-        });
-        tasks = [];
-        const window = Math.floor(NOW / LEASE);
-        const handler = jest.fn(noop);
-
-        expect((await obj.drain("k", handler)).outcome).toBe("busy");
-        expect((await obj.drain("k", handler)).outcome).toBe("busy");
-
-        expect(tasks).toEqual([{ key: "k", id: kickId(`w${window}`), delaySeconds: 61 }]);
-        expect(handler).not.toHaveBeenCalled();
-
-        clock += 61_000;
-        expect(await obj.drain("k", handler)).toMatchObject({ outcome: "idle", processed: 1 });
-    });
-
-    it("a kick that finds the lease still live re-arms in the next lease window", async () => {
-        const obj = make();
-        await obj.send("k", { n: 1 }, { id: "m1" });
-        store.set(object(), {
-            ...store.get(object())!,
-            lease: { holder: "other", epoch: 0, token: "t", expiresAtMs: NOW + 10 * LEASE },
-        });
-        tasks = [];
-
-        await obj.drain("k", noop);
-        clock += 61_000;
-        await obj.drain("k", noop);
-
-        expect(tasks.map((t) => t.id)).toEqual([
-            kickId(`w${Math.floor(NOW / LEASE)}`),
-            kickId(`w${Math.floor((NOW + 61_000) / LEASE)}`),
-        ]);
-    });
-
-    it("a refused drain whose wake-up cannot be armed fails, so the platform retries it", async () => {
-        const obj = make();
-        await obj.send("k", { n: 1 }, { id: "m1" });
-        store.set(object(), {
-            ...store.get(object())!,
-            lease: { holder: "other", epoch: 0, token: "t", expiresAtMs: NOW + LEASE },
-        });
-        enqueueFailure = new Error("tasks down");
-
-        await expect(obj.drain("k", noop)).rejects.toThrow("tasks down");
     });
 
     it("a retry of the same task (higher epoch) takes a live lease over; the same epoch is busy", async () => {
@@ -404,6 +400,82 @@ describe("drain", () => {
         expect(seen).toEqual([2]);
         expect(result).toMatchObject({ outcome: "idle", processed: 1 });
         expect(store.get(object())).toMatchObject({ processedSeq: 2 });
+    });
+
+    describe("an expired backlog", () => {
+        async function backlog(obj: ReturnType<typeof make>, expired: number, live = 0) {
+            for (let n = 1; n <= expired + live; n++) await obj.send("k", { n }, { id: `m${n}` });
+            for (let n = 1; n <= expired; n++) store.delete(item(n));
+            tasks = [];
+        }
+
+        it("stops at the time budget and re-kicks, like a budget stop after handled messages", async () => {
+            const gone: number[] = [];
+            const obj = make("fifo", {
+                drainBudget: { messages: 10, ms: 30_000 },
+                onExpired: ({ seq }) => {
+                    gone.push(seq);
+                    clock += 30_000;
+                },
+            });
+            await backlog(obj, 3, 1);
+            const handler = jest.fn(noop);
+
+            expect(await obj.drain("k", handler)).toEqual({ outcome: "budget", processed: 0, deadLettered: 0 });
+
+            expect(gone).toEqual([1]);
+            expect(handler).not.toHaveBeenCalled();
+            expect(store.get(object())).toMatchObject({ processedSeq: 1, lease: null });
+            expect(tasks).toEqual([{ key: "k", id: kickId("n1.4") }]);
+        });
+
+        it("makes progress on every re-kick, under a fresh id each, until the backlog is gone", async () => {
+            const obj = make("fifo", { onExpired: () => void (clock += 30_000) });
+            await backlog(obj, 3, 1);
+            const seen: number[] = [];
+            const handler: KeyedHandler<Msg, State> = async (_ctx, msg) => void seen.push(msg.n);
+
+            const outcomes = [];
+            for (let i = 0; i < 4; i++) outcomes.push((await obj.drain("k", handler)).outcome);
+
+            expect(outcomes).toEqual(["budget", "budget", "budget", "idle"]);
+            expect(seen).toEqual([4]);
+            expect(tasks.map((t) => t.id)).toEqual([kickId("n1.4"), kickId("n2.4"), kickId("n3.4")]);
+            expect(store.get(object())).toMatchObject({ processedSeq: 4 });
+        });
+
+        it("reports idle, with no re-kick, when the time ran out on the last skip", async () => {
+            const obj = make("fifo", { onExpired: () => void (clock += 30_000) });
+            await backlog(obj, 1);
+
+            expect(await obj.drain("k", noop)).toEqual({ outcome: "idle", processed: 0, deadLettered: 0 });
+
+            expect(tasks).toEqual([]);
+        });
+
+        it("does not spend the message budget: skips never take a handler run away", async () => {
+            const obj = make("fifo", { drainBudget: { messages: 1, ms: 30_000 } });
+            await backlog(obj, 3, 2);
+            const seen: number[] = [];
+
+            const result = await obj.drain("k", async (_ctx, msg) => void seen.push(msg.n));
+
+            expect(seen).toEqual([4]);
+            expect(result).toEqual({ outcome: "budget", processed: 1, deadLettered: 0 });
+            expect(store.get(object())).toMatchObject({ processedSeq: 4 });
+            expect(tasks.map((t) => t.id)).toEqual([kickId("n4.5")]);
+        });
+
+        it("a slow start still skips one per drain, instead of never moving", async () => {
+            for (const n of [1, 2]) await make().send("k", { n }, { id: `m${n}` });
+            for (const n of [1, 2]) store.delete(item(n));
+            let reads = 0;
+            const obj = make("fifo", { runtime: { now: () => NOW + (reads++ ? 10_000 : 0) }, drainBudget: { messages: 10, ms: 1 } });
+
+            expect((await obj.drain("k", noop)).outcome).toBe("budget");
+
+            expect(store.get(object())).toMatchObject({ processedSeq: 1 });
+        });
     });
 });
 
@@ -572,6 +644,133 @@ describe("ctx.once", () => {
         });
 
         expect(seen).toEqual([1, 2]);
+    });
+
+    describe("concurrent calls with one name", () => {
+        function gate<T>() {
+            let open!: (value: T) => void;
+            let fail!: (err: unknown) => void;
+            const promise = new Promise<T>((resolve, reject) => {
+                open = resolve;
+                fail = reject;
+            });
+            return { promise, open, fail };
+        }
+
+        it("share one execution and one result, journaled once", async () => {
+            const obj = make();
+            await obj.send("k", { n: 1 }, { id: "m1" });
+            const release = gate<{ receipt: string }>();
+            const step = jest.fn(() => release.promise);
+            const journalWrites = jest.spyOn(fakeDb, "runTransaction");
+            let results: unknown[] = [];
+
+            await obj.drain("k", async (ctx) => {
+                const calls = [ctx.once("charge", step), ctx.once("charge", step), ctx.once("charge", step)];
+                const before = journalWrites.mock.calls.length;
+                release.open({ receipt: "r1" });
+                results = await Promise.all(calls);
+                expect(journalWrites.mock.calls.length - before).toBe(1);
+            });
+            journalWrites.mockRestore();
+
+            expect(step).toHaveBeenCalledTimes(1);
+            expect(results).toEqual([{ receipt: "r1" }, { receipt: "r1" }, { receipt: "r1" }]);
+        });
+
+        it("share a rejection: every caller sees the same error, and nothing is journaled", async () => {
+            const obj = make();
+            await obj.send("k", { n: 1 }, { id: "m1" });
+            const release = gate<number>();
+            const step = jest.fn(() => release.promise);
+            const boom = new Error("provider down");
+            let settled: PromiseSettledResult<number>[] = [];
+
+            const result = await obj.drain("k", async (ctx) => {
+                const calls = Promise.allSettled([ctx.once("charge", step), ctx.once("charge", step)]);
+                release.fail(boom);
+                settled = await calls;
+                throw boom;
+            });
+
+            expect(step).toHaveBeenCalledTimes(1);
+            expect(settled).toEqual([{ status: "rejected", reason: boom }, { status: "rejected", reason: boom }]);
+            expect(result.outcome).toBe("retrying");
+            expect(store.get(item(1))).not.toHaveProperty("journal");
+        });
+
+        it("run again when called after the shared failure settled, as a sequential retry does", async () => {
+            const obj = make();
+            await obj.send("k", { n: 1 }, { id: "m1" });
+            const step = jest.fn<Promise<string>, []>()
+                .mockRejectedValueOnce(new Error("flaky"))
+                .mockResolvedValueOnce("second try");
+            let later: unknown;
+
+            await obj.drain("k", async (ctx) => {
+                await ctx.once("charge", step).catch(() => undefined);
+                later = await ctx.once("charge", step);
+            });
+
+            expect(step).toHaveBeenCalledTimes(2);
+            expect(later).toBe("second try");
+        });
+
+        it("a step that throws synchronously rejects its callers and leaves nothing in flight", async () => {
+            const obj = make();
+            await obj.send("k", { n: 1 }, { id: "m1" });
+            let calls = 0;
+            const step = () => {
+                if (++calls === 1) throw new Error("sync");
+                return Promise.resolve("ok");
+            };
+            let settled: PromiseSettledResult<string>[] = [];
+            let later: unknown;
+
+            await obj.drain("k", async (ctx) => {
+                settled = await Promise.allSettled([ctx.once("charge", step)]);
+                later = await ctx.once("charge", step);
+            });
+
+            expect(settled[0]).toMatchObject({ status: "rejected" });
+            expect(later).toBe("ok");
+            expect(calls).toBe(2);
+        });
+
+        it("different names still run independently", async () => {
+            const obj = make();
+            await obj.send("k", { n: 1 }, { id: "m1" });
+            const a = jest.fn(async () => "a");
+            const b = jest.fn(async () => "b");
+            let results: unknown[] = [];
+
+            await obj.drain("k", async (ctx) => {
+                results = await Promise.all([ctx.once("a", a), ctx.once("b", b)]);
+                expect(store.get(item(1))).toMatchObject({ journal: { a: { json: '"a"' }, b: { json: '"b"' } } });
+            });
+
+            expect(results).toEqual(["a", "b"]);
+            expect(a).toHaveBeenCalledTimes(1);
+            expect(b).toHaveBeenCalledTimes(1);
+        });
+
+        it("a redelivery returns the journaled result to all of them without re-running", async () => {
+            const obj = make();
+            await obj.send("k", { n: 1 }, { id: "m1" });
+            const step = jest.fn(async () => "r1");
+            const results: unknown[] = [];
+            const handler: KeyedHandler<Msg, State> = async (ctx) => {
+                results.push(await Promise.all([ctx.once("charge", step), ctx.once("charge", step)]));
+                if (ctx.attempt === 1) throw new Error("later step failed");
+            };
+
+            await obj.drain("k", handler);
+            clock += 10_000;
+            await obj.drain("k", handler);
+
+            expect(step).toHaveBeenCalledTimes(1);
+            expect(results).toEqual([["r1", "r1"], ["r1", "r1"]]);
+        });
     });
 });
 
@@ -855,6 +1054,297 @@ describe("objectTtl (a restartable object)", () => {
         clock += 5;
         expect(await obj.send("k", { n: 4 }, { id: "m1" })).toBe("accepted");
         expect(tasks).toHaveLength(1);
+    });
+
+});
+
+describe("a refused drain", () => {
+    it("arms nothing, and a holder that vanished is recovered by a sweep once its lease expired", async () => {
+        const obj = make();
+        await obj.send("k", { n: 1 }, { id: "m1" });
+        // A drain whose release failed: its lease stays live and no task will retry.
+        store.set(object(), {
+            ...store.get(object())!,
+            lease: { holder: "gone", epoch: 0, token: "t", expiresAtMs: NOW + LEASE },
+        });
+        tasks = [];
+        const handler = jest.fn(noop);
+
+        expect((await obj.drain("k", handler)).outcome).toBe("busy");
+        expect(tasks).toEqual([]);
+
+        // A sweep past the threshold kicks, and that kick finds the lease expired.
+        clock += SWEEP.olderThanMs;
+        expect(await obj.sweep(SWEEP)).toMatchObject({ rekicked: 1 });
+        expect(await obj.drain("k", handler)).toMatchObject({ outcome: "idle", processed: 1 });
+        expect(handler).toHaveBeenCalledTimes(1);
+    });
+
+    it("a sweep kick that still finds a live lease is retried with a new id in the next window", async () => {
+        const obj = make();
+        await obj.send("k", { n: 1 }, { id: "m1" });
+        store.set(object(), {
+            ...store.get(object())!,
+            lease: { holder: "slow", epoch: 0, token: "t", expiresAtMs: NOW + 2 * SWEEP.olderThanMs },
+        });
+        tasks = [];
+        clock += SWEEP.olderThanMs;
+        await obj.sweep(SWEEP);
+        expect((await obj.drain("k", noop)).outcome).toBe("busy");
+
+        clock += SWEEP.olderThanMs;
+        expect(await obj.sweep(SWEEP)).toMatchObject({ rekicked: 1, coalesced: 0 });
+        expect(new Set(tasks.map((t) => t.id)).size).toBe(2);
+        expect(await obj.drain("k", noop)).toMatchObject({ outcome: "idle", processed: 1 });
+    });
+});
+
+describe("sweep", () => {
+    /** The kick a lost `send` left unarmed: the message is there, no task is. */
+    async function pending(obj: ReturnType<typeof make>, key: string, n = 1) {
+        await obj.send(key, { n }, { id: `${key}-${n}`, kick: false });
+    }
+
+    it("recovers a lost kick: nothing before the threshold, one task after it, and the message runs", async () => {
+        const obj = make();
+        await pending(obj, "k");
+
+        clock += SWEEP.olderThanMs - 1;
+        expect(await obj.sweep(SWEEP)).toEqual({ ...EMPTY, scanned: 1, recent: 1 });
+        expect(tasks).toEqual([]);
+
+        clock += 1;
+        expect(await obj.sweep(SWEEP)).toEqual({ ...EMPTY, scanned: 1, rekicked: 1 });
+        expect(tasks).toEqual([{ key: "k", id: sweepId("k"), delaySeconds: undefined }]);
+        expect(tasks[0].id).toMatch(/^objects-[0-9a-f]{32}-\d+$/);
+
+        expect(await obj.drain("k", noop)).toMatchObject({ outcome: "idle", processed: 1 });
+        expect(await obj.sweep(SWEEP)).toEqual(EMPTY);
+    });
+
+    it("recovers an accepted send whose kick id Cloud Tasks refused, for a seq a clock running behind repeated", async () => {
+        const objectTtl = { ms: 3 * TTL };
+        const first = make("fifo", { objectTtl });
+        await first.send("k", { n: 1 }, { id: "a" });
+        await first.drain("k", noop);
+        await first.purge("k");
+        tasks = [];
+
+        const behind = make("fifo", { objectTtl });
+        expect(await behind.send("k", { n: 2 }, { id: "b" })).toBe("accepted");
+        expect(tasks).toEqual([]); // Control: same clock, same seq, its `s` id was refused.
+
+        clock += SWEEP.olderThanMs;
+        expect(await behind.sweep(SWEEP)).toMatchObject({ rekicked: 1 });
+        expect(await behind.drain("k", noop)).toMatchObject({ outcome: "idle", processed: 1 });
+    });
+
+    describe("a retry task that re-arms its own running id", () => {
+        /** A failed attempt, whose retry kick fires while this instance's clock is `skewMs` behind. */
+        async function firedEarly(skewMs: number) {
+            const obj = make();
+            await obj.send("k", { n: 1 }, { id: "m1" });
+            await obj.drain("k", async () => { throw new Error("boom"); });
+            const armed = tasks[tasks.length - 1];
+            expect(armed.id).toBe(kickId("r1.1"));
+            clock = NOW + 10_000 + 1_000 - skewMs; // backoff 10 s, then the delay's ceil + 1 s
+            const taskCount = tasks.length;
+            return { obj, taskCount };
+        }
+
+        it("control: under the tolerance the attempt runs, so there is nothing to strand", async () => {
+            const { obj } = await firedEarly(1_500);
+            expect((await obj.drain("k", noop)).outcome).toBe("idle");
+        });
+
+        it("past the tolerance the id is refused and read as success; the sweep recovers the message", async () => {
+            const { obj, taskCount } = await firedEarly(3_000);
+
+            expect((await obj.drain("k", noop)).outcome).toBe("waiting");
+            expect(tasks).toHaveLength(taskCount); // Stranded: no new task.
+
+            clock += SWEEP.olderThanMs + 3_000;
+            expect(await obj.sweep(SWEEP)).toMatchObject({ rekicked: 1 });
+            expect(await obj.drain("k", noop)).toMatchObject({ outcome: "idle", processed: 1 });
+        });
+    });
+
+    describe("a head in backoff", () => {
+        async function backingOff() {
+            const obj = make("fifo", { backoff: { baseMs: 2 * SWEEP.olderThanMs, maxMs: 2 * SWEEP.olderThanMs } });
+            await obj.send("k", { n: 1 }, { id: "m1" });
+            await obj.drain("k", async () => { throw new Error("boom"); });
+            return obj;
+        }
+
+        it("is skipped however old it is, and its retry timing and task stay untouched", async () => {
+            const obj = await backingOff();
+            const before = store.get(item(1));
+            const armed = [...tasks];
+
+            clock += SWEEP.olderThanMs + 1;
+            expect(await obj.sweep(SWEEP)).toEqual({ ...EMPTY, scanned: 1, backingOff: 1 });
+
+            expect(tasks).toEqual(armed);
+            expect(store.get(item(1))).toEqual(before);
+        });
+
+        it("a sweep kick racing into a backoff only re-arms the same id: waiting, no attempt spent, same due time", async () => {
+            const obj = await backingOff();
+            const before = store.get(item(1));
+            const armed = [...tasks];
+            const handler = jest.fn(noop);
+
+            clock += 1_000;
+            expect((await obj.drain("k", handler)).outcome).toBe("waiting");
+
+            expect(handler).not.toHaveBeenCalled();
+            expect(store.get(item(1))).toEqual(before);
+            expect(tasks).toEqual(armed);
+        });
+
+        it("is left alone for `olderThanMs` after it comes due, while its armed retry kick runs", async () => {
+            const obj = await backingOff();
+            clock += 2 * SWEEP.olderThanMs;
+            expect(await obj.sweep(SWEEP)).toEqual({ ...EMPTY, scanned: 1, recent: 1 });
+            clock += SWEEP.olderThanMs;
+            expect(await obj.sweep(SWEEP)).toEqual({ ...EMPTY, scanned: 1, rekicked: 1 });
+        });
+    });
+
+    it("an old head that just started an attempt is left alone, even with its lease gone", async () => {
+        const obj = make();
+        await pending(obj, "k");
+        clock += 10 * SWEEP.olderThanMs;
+        store.set(item(1), { ...store.get(item(1))!, startedAt: new Date(clock - 1) });
+        expect(await obj.sweep(SWEEP)).toEqual({ ...EMPTY, scanned: 1, recent: 1 });
+    });
+
+    it("a healthy old head costs one no-op drain, and kicks coalesce within a window", async () => {
+        const obj = make();
+        await obj.send("k", { n: 1 }, { id: "m1" });
+        const sendKick = tasks[0];
+        tasks = [];
+        clock += SWEEP.olderThanMs;
+        expect(await obj.sweep(SWEEP)).toMatchObject({ rekicked: 1 });
+        expect(await obj.sweep(SWEEP)).toMatchObject({ rekicked: 0, coalesced: 1 });
+        expect(tasks).toHaveLength(1);
+
+        const handler = jest.fn(noop);
+        expect(await obj.drain("k", handler)).toMatchObject({ outcome: "idle", processed: 1 });
+        expect(await obj.drain(sendKick.key, handler)).toEqual({ outcome: "idle", processed: 0, deadLettered: 0 });
+        expect(handler).toHaveBeenCalledTimes(1);
+    });
+
+    describe("at a window boundary", () => {
+        it("a kick refused inside a window leaves the key to the next window's new id, which is not refused", async () => {
+            const windowMs = SWEEP.olderThanMs;
+            const boundary = (Math.floor(NOW / windowMs) + 2) * windowMs;
+            const obj = make();
+            await pending(obj, "k");
+
+            clock = boundary + 1;
+            expect(await obj.sweep(SWEEP)).toMatchObject({ rekicked: 1 }); // That task runs and finds the key busy.
+            clock = boundary + windowMs - 1;
+            expect(await obj.sweep(SWEEP)).toMatchObject({ rekicked: 0, coalesced: 1 }); // Refused.
+            clock = boundary + windowMs;
+            expect(await obj.sweep(SWEEP)).toMatchObject({ rekicked: 1, coalesced: 0 });
+            expect(new Set(tasks.map((t) => t.id)).size).toBe(2);
+        });
+    });
+
+    it("a failed enqueue is counted, does not stop the other keys, and the next run retries", async () => {
+        const obj = make();
+        await pending(obj, "a");
+        await pending(obj, "b");
+        clock += SWEEP.olderThanMs;
+        enqueueFailure = new Error("tasks down");
+        expect(await obj.sweep(SWEEP)).toEqual({ ...EMPTY, scanned: 2, failed: 2, error: "Error: tasks down" });
+
+        enqueueFailure = undefined;
+        expect(await obj.sweep(SWEEP)).toMatchObject({ rekicked: 2, failed: 0 });
+    });
+
+    it("a kick for a key with no pending message is harmless", async () => {
+        const obj = make();
+        await obj.send("k", { n: 1 }, { id: "m1" });
+        await obj.drain("k", noop);
+        const before = store.get(object());
+        expect(await obj.drain("k", noop)).toEqual({ outcome: "idle", processed: 0, deadLettered: 0 });
+        expect(store.get(object())).toEqual(before);
+        // No object at all: a stray document costs one no-op, and creates nothing.
+        store.set(item(1, "orphan"), { seq: 1, createdAt: new Date(NOW) });
+        clock += SWEEP.olderThanMs;
+        expect(await obj.sweep(SWEEP)).toMatchObject({ scanned: 1, rekicked: 1 });
+        expect(await obj.drain("orphan", noop)).toEqual({ outcome: "idle", processed: 0, deadLettered: 0 });
+        expect(store.has(object("orphan"))).toBe(false);
+    });
+
+    describe("bounds", () => {
+        it("reads one head per key however long the backlog, in key order", async () => {
+            const obj = make();
+            for (let n = 1; n <= 30; n++) await pending(obj, "a", n);
+            await pending(obj, "b");
+            clock += SWEEP.olderThanMs;
+            const reads = spyReads();
+
+            expect(await obj.sweep(SWEEP)).toEqual({ ...EMPTY, scanned: 2, rekicked: 2 });
+
+            expect(reads.docs()).toBe(2);
+            reads.restore();
+            expect(tasks.map((t) => t.key)).toEqual(["a", "b"]);
+        });
+
+        it("stops at `limit` keys and says so; kicked keys clear, so the next run reaches the rest", async () => {
+            const obj = make();
+            for (const key of ["a", "b", "c"]) await pending(obj, key);
+            clock += SWEEP.olderThanMs;
+
+            expect(await obj.sweep({ ...SWEEP, limit: 2 })).toEqual({ ...EMPTY, scanned: 2, rekicked: 2, truncated: true });
+            expect(tasks.map((t) => t.key)).toEqual(["a", "b"]);
+            await obj.drain("a", noop);
+            await obj.drain("b", noop);
+
+            clock += SWEEP.olderThanMs;
+            expect(await obj.sweep({ ...SWEEP, limit: 2 })).toEqual({ ...EMPTY, scanned: 1, rekicked: 1 });
+            expect(tasks.map((t) => t.key)).toEqual(["a", "b", "c"]);
+        });
+
+        it("is not truncated when `limit` is exactly the number of keys", async () => {
+            const obj = make();
+            await pending(obj, "a");
+            clock += SWEEP.olderThanMs;
+            expect(await obj.sweep({ ...SWEEP, limit: 1 })).toEqual({ ...EMPTY, scanned: 1, rekicked: 1 });
+        });
+
+        it("rejects a bad threshold or limit", async () => {
+            await expect(make().sweep({ olderThanMs: 0, limit: 1 })).rejects.toThrow(/olderThanMs/);
+            await expect(make().sweep({ olderThanMs: 1, limit: 0 })).rejects.toThrow(/limit/);
+            await expect(make().sweep({ olderThanMs: 1, limit: 1.5 })).rejects.toThrow(/limit/);
+        });
+    });
+
+    it("sees only its own object: another object's backlog neither counts nor starves it", async () => {
+        const mine = make();
+        const other = make("fifo", { name: "others" });
+        for (const key of ["a", "b", "c", "d", "e"]) await other.send(key, { n: 1 }, { id: key, kick: false });
+        await pending(mine, "z");
+        clock += SWEEP.olderThanMs;
+
+        expect(await mine.sweep({ ...SWEEP, limit: 1 })).toEqual({ ...EMPTY, scanned: 1, rekicked: 1 });
+        expect(tasks.map((t) => t.key)).toEqual(["z"]);
+        expect(await other.sweep({ ...SWEEP, limit: 5 })).toEqual({ ...EMPTY, scanned: 5, rekicked: 5 });
+    });
+
+    it("masks the read: no message content reaches the sweep", async () => {
+        const obj = make();
+        await pending(obj, "k");
+        clock += SWEEP.olderThanMs;
+        const reads = spyReads();
+        await obj.sweep(SWEEP);
+        reads.restore();
+        expect(reads.masks).toEqual([["createdAt", "notBefore", "startedAt"]]);
+        expect(reads.fields()).not.toContain("msg");
     });
 });
 

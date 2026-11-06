@@ -177,6 +177,9 @@ await conversations.drain(key, async (ctx, msg) => {
 - **Ordering:** `seq` follows `send` commit order, not the provider's timestamp.
 - **Failure:** a failing head blocks its key, with backoff, until it succeeds or
   moves to the dead-letter collection. Other keys are not affected.
+- **Lost kicks:** call `sweep({ olderThanMs, limit })` on a schedule. It re-kicks a
+  key whose oldest pending message saw no activity for `olderThanMs`, which you keep
+  above `leaseMs`. Without it, a key that lost every kick waits for its next send.
 - **Budget one drain per task** if a handler can take close to the worker's timeout.
 - **Erasure:** set `objectTtl` to enable `purge(key)` and let idle objects expire.
 - **Personal data:** the key is stored as a document id and messages are stored as
@@ -191,8 +194,9 @@ concurrency is yours to set.
   must be idempotent, go through `ctx.tx`, or use `ctx.once`.
 - `ctx.once` narrows the duplicate window but does not close it: a crash between
   the step and its journal write re-runs the step.
-- Liveness rests on tasks. A mailbox key whose kicks were all lost (a purged queue,
-  exhausted retries) waits for its next `send` with a new id. There is no sweep yet.
+- Liveness rests on tasks plus `sweep`. A stranded key waits up to about two sweep
+  periods past `olderThanMs`. With the worker down past `inboxTtl`, messages are lost,
+  and `onExpired` only fires on that key's next drain.
 - Field names and document ids are a wire format shared with every deployed version.
   Changing them is a data migration.
 

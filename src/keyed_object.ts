@@ -39,18 +39,20 @@ import type { TaskQueue } from "./task_queue";
  * Invariants:
  * - `send` is ONE transaction (`defineLedger.applyOnce`): the create-only
  *   dedupe marker, the message, and `lastSeq + 1`. Seqs are therefore gap-free
- *   and in commit order. The drain kick is enqueued AFTER the commit, with a
- *   task id derived from (key, seq); a duplicate send while messages are
- *   pending re-kicks the newest one's id, so a send retried after a failed
- *   kick heals.
+ *   and in commit order. It reads the object in that transaction, so concurrent
+ *   sends serialize and `lastSeq + 1` cannot be a live message: whatever sits
+ *   there is a purged generation's leftover, and the message overwrites it. The
+ *   drain kick is enqueued AFTER the commit, with a task id derived from (key,
+ *   seq); a duplicate send while messages are pending re-kicks the newest one's
+ *   id, so a send retried after a failed kick heals.
  * - One active handler per key: `drain` holds the key's lease (field mode on
  *   the object document, owner = the task, epoch = its retry count, so a
  *   platform retry of a crashed drain takes over at once). Contention is
  *   `busy`, not an error: the holder re-reads the mailbox after every message
  *   and, after releasing, re-checks it and kicks again if a send raced the
- *   release (the lost-wakeup window). A refused drain also arms one delayed
- *   kick per lease window, past the expiry, so a holder that vanished without
- *   releasing cannot strand the key.
+ *   release (the lost-wakeup window). A refused drain arms nothing: a holder
+ *   that vanished without releasing is the sweep's to recover, once its lease
+ *   has expired.
  * - Every drain-side write (attempt counts, `ctx.tx`, `ctx.once` journal,
  *   seq advance, dead letters) commits through the lease fence: a drain whose
  *   lease was taken over writes nothing more and reports `lost`.
@@ -59,7 +61,9 @@ import type { TaskQueue } from "./task_queue";
  *   is redelivered (`ctx.attempt` > 1). There is no deterministic replay;
  *   `ctx.once` journals a step's JSON result on the message so a redelivery
  *   returns it instead of re-running the step (a crash between the step and
- *   its journal write still re-runs it).
+ *   its journal write still re-runs it). Concurrent calls with one name share
+ *   one execution and its outcome, a rejection included; a call after a failure
+ *   settled runs the step again.
  * - `processedSeq` advances in the same commit as `ctx.tx`'s writes, or, if
  *   the handler never calls `ctx.tx`, right after it returns. A handler that
  *   throws after its `ctx.tx` committed has still processed the message; the
@@ -72,8 +76,34 @@ import type { TaskQueue } from "./task_queue";
  * - `leaseMs` must exceed the worker's timeout (the platform kills a drain at
  *   its timeout), and `drainBudget` bounds one drain (fairness across keys,
  *   and staying under that timeout): when spent, the drain re-kicks the key.
- * - Liveness rests on kicks: a key whose every pending kick was lost (queue
- *   retries exhausted, queue purged) waits for its next send with a new id.
+ *   The time check applies once the drain made progress of any kind (a run, a
+ *   dead letter, a skip), so a slow acquire cannot spend it and an expired
+ *   backlog cannot outrun it. Only handler runs spend `messages`.
+ * - Liveness rests on kicks plus `sweep`. A kick can be lost: queue retries
+ *   exhausted, queue purged, a process killed between a commit and its enqueue,
+ *   or an id Cloud Tasks still refuses, read as success (a seq repeated by a
+ *   restart with a clock behind; a retry task that re-arms its own running id,
+ *   when an instance ~1-3 s behind finds the message `waiting`). A holder can
+ *   also vanish, and the kicks it refused armed nothing. All of these leave the
+ *   same state, a mailbox document with nothing coming for it, because the
+ *   document is deleted when its message completes or dead-letters. `sweep`
+ *   re-kicks those keys, so recovery takes one to two sweep periods past the
+ *   threshold, not a next send. A `busy` caused by acquire contention, with no
+ *   holder at all, recovers the same way when no other kick follows.
+ * - `sweep` is one read per key: the head (lowest document id) of each key with
+ *   a pending message, through a document-name range on the `mailbox` collection
+ *   group. The range scopes it to this object, so objects sharing the group
+ *   cannot starve each other, and it jumps past the rest of a key, so one long
+ *   backlog costs one read. It needs no index (unfiltered, ascending; checked on
+ *   a real backend, not just the emulator, which enforces none) and the field
+ *   mask keeps it off message content. A head in backoff is skipped, since its
+ *   retry kick is armed, and so is one with activity inside `olderThanMs`. Sweep
+ *   kicks use a time window of `olderThanMs`, so runs inside one window coalesce;
+ *   a refused kick costs one more run, because the next window's id is new. A
+ *   stray document with no object costs one no-op drain per window until its TTL.
+ * - What liveness does not cover: a worker down past `inboxTtl` loses the
+ *   messages (the TTL deletes them, and the sweep sees nothing), and `onExpired`
+ *   reports that only on the key's next drain, which takes a later send.
  * - Messages, markers and dead letters carry the TTL field; Firestore's TTL
  *   policy (configured outside this code, per collection group) bounds them,
  *   so `inboxTtl.ms` is also the dedupe window and the longest a message may
@@ -81,10 +111,14 @@ import type { TaskQueue } from "./task_queue";
  *   object document has no TTL by default: deleting it restarts `seq`, and a
  *   reused seq collides with live children and with kick ids Cloud Tasks still
  *   remembers (up to 24 h). An object that must disappear with its data sets
- *   `objectTtl`: a generation then starts its seqs from the clock, so neither
- *   the TTL policy nor `purge` can make a later send reuse one.
+ *   `objectTtl`: a generation then starts its seqs from the clock, which keeps
+ *   its documents clear of an earlier generation's unless clocks disagree. If
+ *   they do, a repeated seq overwrites a leftover document and may have its kick
+ *   refused, which the sweep covers. A kick names only the key, so one from an
+ *   earlier generation just drains the current one.
  * - Field names, document ids and the kick-id tags are the wire format shared
- *   with every deployed version. Changing them is a data migration.
+ *   with every deployed version. Changing them is a data migration. A kick id
+ *   only coalesces, so the worst mix of versions is one extra no-op drain.
  */
 
 export type KeyedObjectMode = "fifo" | "latest";
@@ -124,7 +158,7 @@ export interface KeyedObjectConfig<M> {
     backoff: { baseMs: number; maxMs: number };
     /** The TTL field on messages, markers and dead letters, and its horizon. */
     inboxTtl: { field: string; ms: number };
-    /** Handler runs and wall time one drain may spend before re-kicking. */
+    /** Handler runs, and wall time including skips, one drain may spend before re-kicking. */
     drainBudget: { messages: number; ms: number };
     /** Called after a dead letter commits. Errors are ignored. */
     onDeadLetter?: (letter: KeyedDeadLetter<M>) => void | Promise<void>;
@@ -167,7 +201,8 @@ export interface KeyedContext<S> {
     tx(fn: (tx: Transaction, state: S | undefined) => Promise<S | undefined> | S | undefined): Promise<S | undefined>;
     /**
      * Run `fn` once per message; a redelivery returns its stored JSON result.
-     * The result lives on the message document, so keep it small.
+     * The result lives on the message document, so keep it small. Concurrent
+     * calls with one name share one run and its outcome, a rejection included.
      */
     once<T>(name: string, fn: () => Promise<T>): Promise<T>;
 }
@@ -176,7 +211,8 @@ export type KeyedHandler<M, S> = (ctx: KeyedContext<S>, msg: M) => Promise<void>
 
 /**
  * - `idle`: the mailbox was empty.
- * - `busy`: another drain holds the key; it will see this kick's message.
+ * - `busy`: another drain holds the key; it will see this kick's message, or the
+ *   sweep re-kicks the key if it is gone.
  * - `budget`: the drain budget ran out with messages left; the key was re-kicked.
  * - `retrying`: the head message failed and a delayed retry kick is armed.
  * - `waiting`: the head message is backing off; its retry kick is armed.
@@ -196,6 +232,36 @@ export interface DrainOptions {
     owner?: LeaseOwner;
 }
 
+export interface KeyedSweepOptions {
+    /**
+     * Re-kick a key whose head saw no activity (created, due or started) for this
+     * long. Keep it above `leaseMs`, so a kick finds a vanished holder's lease
+     * expired. Also the coalescing window of sweep kicks.
+     */
+    olderThanMs: number;
+    /** Keys examined per call, one read each; also bounds the kicks. */
+    limit: number;
+}
+
+export interface KeyedSweepResult {
+    /** Keys with a pending message that were examined. */
+    scanned: number;
+    /** Stale keys given a new kick. */
+    rekicked: number;
+    /** Stale keys whose kick for this window already exists or existed. */
+    coalesced: number;
+    /** Keys whose head is backing off: its retry kick is armed. */
+    backingOff: number;
+    /** Keys whose head saw activity within `olderThanMs`. */
+    recent: number;
+    /** Stale keys whose kick failed to enqueue; the next run tries again. */
+    failed: number;
+    /** The first enqueue failure, when any. */
+    error?: string;
+    /** `limit` was reached with keys left, which then wait for the ones ahead to clear. */
+    truncated: boolean;
+}
+
 export interface KeyedObject<M, S> {
     send(key: string, msg: M, options: SendOptions): Promise<SendOutcome>;
     drain(key: string, handler: KeyedHandler<M, S>, options?: DrainOptions): Promise<DrainResult>;
@@ -209,6 +275,8 @@ export interface KeyedObject<M, S> {
      * drain then skips past it (`onExpired`).
      */
     purge(key: string): Promise<number>;
+    /** Re-kick keys whose pending message may have lost its kick. Reads no message content. */
+    sweep(options: KeyedSweepOptions): Promise<KeyedSweepResult>;
 }
 
 const MAILBOX = "mailbox";
@@ -220,6 +288,10 @@ const STATE_FIELD = "state";
 /** A due time this close is due: absorbs instance clock skew against Cloud Tasks. */
 const DUE_TOLERANCE_MS = 1_000;
 const PURGE_PAGE = 200;
+const DOCUMENT_NAME = "__name__";
+/** Document-id bounds below and above any key or message id. */
+const ID_MIN = "\u0000";
+const ID_MAX = "\u{10ffff}";
 const ONCE_NAME = /^[A-Za-z0-9_-]{1,100}$/;
 const OBJECT_NAME = /^[A-Za-z0-9_-]{1,100}$/;
 
@@ -259,7 +331,15 @@ type Picked<M, S> =
     | { kind: "skipped"; seq: number }
     | { kind: "dead"; letter: KeyedDeadLetter<M> }
     | { kind: "waiting"; seq: number; attempts: number; notBeforeMs: number }
-    | { kind: "run"; seq: number; id: string; msg: M; attempts: number; journal: Record<string, JournalEntry>; state: S | undefined };
+    | {
+        kind: "run";
+        seq: number;
+        id: string;
+        msg: M;
+        attempts: number;
+        journal: Record<string, JournalEntry>;
+        state: S | undefined;
+    };
 
 export function defineKeyedObject<M, S = DocumentData>(config: KeyedObjectConfig<M>): KeyedObject<M, S> {
     const { db, name, mode, queue, leaseMs, maxAttempts, backoff, inboxTtl, drainBudget, deleteField, objectTtl } = config;
@@ -318,7 +398,8 @@ export function defineKeyedObject<M, S = DocumentData>(config: KeyedObjectConfig
     /**
      * `processedSeq` of a new object: the clock, in ms, when the object can restart.
      * Reaching the next generation's seqs would take a generation sending more than
-     * one message per millisecond.
+     * one message per millisecond, or a clock running behind: a seq may then repeat
+     * (see the sweep in the header).
      */
     const originSeq = (nowMs: number): number => (objectTtl ? nowMs : 0);
     const backoffMs = (attempts: number): number =>
@@ -328,11 +409,7 @@ export function defineKeyedObject<M, S = DocumentData>(config: KeyedObjectConfig
     /** The message document holds `seq` (in `latest` mode it may hold a newer one). */
     const holds = (snap: DocumentSnapshot, seq: number): boolean => snap.exists && snap.get("seq") === seq;
 
-    /**
-     * Kick ids are (key, tag): `s<seq>` per send, `r<seq>.<attempts>` per
-     * retry, `n<processedSeq>.<lastSeq>` per re-kick of a backlog position,
-     * `w<lease window>` per wake-up past a lease that refused a drain.
-     */
+    /** Kick ids: `s<seq>` per send, `r<seq>.<attempts>` per retry, `n<processedSeq>.<lastSeq>` per backlog position. */
     const kick = async (key: string, tag: string, delayMs = 0): Promise<void> => {
         const delaySeconds = delayMs > 0 ? Math.ceil(delayMs / 1000) + 1 : undefined;
         await queue.enqueueOnce(
@@ -441,6 +518,8 @@ export function defineKeyedObject<M, S = DocumentData>(config: KeyedObjectConfig
         const { seq, attempts, journal } = pick;
         const ref = itemRef(key, seq);
         let committed = false;
+        /** Steps running in this attempt, so concurrent callers of one name share a run. */
+        const running = new Map<string, Promise<unknown>>();
 
         const ctx: KeyedContext<S> = {
             key,
@@ -466,15 +545,26 @@ export function defineKeyedObject<M, S = DocumentData>(config: KeyedObjectConfig
                     const stored = journal[step].json;
                     return (stored === undefined ? undefined : JSON.parse(stored)) as T;
                 }
-                const value = await fn();
-                const entry: JournalEntry = value === undefined ? {} : { json: JSON.stringify(value) };
-                await held.tx(async (tx) => {
-                    const item = await tx.get(ref);
-                    // Superseded (latest mode) or gone: nothing to journal on.
-                    if (holds(item, seq)) tx.update(ref, { [`journal.${step}`]: entry });
-                });
-                journal[step] = entry;
-                return value;
+                const inFlight = running.get(step);
+                if (inFlight) return inFlight as Promise<T>;
+                const execute = async (): Promise<T> => {
+                    const value = await fn();
+                    const entry: JournalEntry = value === undefined ? {} : { json: JSON.stringify(value) };
+                    await held.tx(async (tx) => {
+                        const item = await tx.get(ref);
+                        // Superseded (latest mode) or gone: nothing to journal on.
+                        if (holds(item, seq)) tx.update(ref, { [`journal.${step}`]: entry });
+                    });
+                    journal[step] = entry;
+                    return value;
+                };
+                const run = execute();
+                running.set(step, run);
+                try {
+                    return await run;
+                } finally {
+                    running.delete(step);
+                }
             },
         };
 
@@ -532,6 +622,52 @@ export function defineKeyedObject<M, S = DocumentData>(config: KeyedObjectConfig
             return deleted;
         },
 
+        async sweep({ olderThanMs, limit }) {
+            positive("olderThanMs", olderThanMs);
+            if (!Number.isInteger(limit) || limit < 1) {
+                throw new Error(`defineKeyedObject: limit must be a positive integer, got ${limit}`);
+            }
+            const result: KeyedSweepResult = { scanned: 0, rekicked: 0, coalesced: 0, backingOff: 0, recent: 0, failed: 0, truncated: false };
+            const nowMs = runtime.now();
+            const heads = db
+                .collectionGroup(MAILBOX)
+                .orderBy(DOCUMENT_NAME)
+                .endBefore(`${name}/${ID_MAX}`)
+                .select("createdAt", "notBefore", "startedAt")
+                .limit(1);
+            let cursor = `${name}/${ID_MIN}`;
+            for (;;) {
+                const [head] = (await heads.startAfter(cursor).get()).docs;
+                if (!head) return result;
+                if (result.scanned >= limit) return { ...result, truncated: true };
+                result.scanned++;
+                const key = head.ref.path.split("/")[1];
+                cursor = `${name}/${key}/${MAILBOX}/${ID_MAX}`;
+
+                const notBeforeMs = toMillis(head.get("notBefore"));
+                if (notBeforeMs > nowMs) {
+                    result.backingOff++;
+                    continue;
+                }
+                const activeMs = Math.max(toMillis(head.get("createdAt")), notBeforeMs, toMillis(head.get("startedAt")));
+                if (nowMs - activeMs < olderThanMs) {
+                    result.recent++;
+                    continue;
+                }
+                try {
+                    const outcome = await queue.enqueueOnce(
+                        { key },
+                        { prefix: name, key: `${key}\nsweep`, window: { seconds: olderThanMs / 1000 } },
+                    );
+                    if (outcome === "created") result.rekicked++;
+                    else result.coalesced++;
+                } catch (err) {
+                    result.failed++;
+                    result.error ??= describeError(err);
+                }
+            }
+        },
+
         async send(key, msg, options) {
             const { id } = options;
             if (!id) throw new Error(`defineKeyedObject(${name}): send needs an id`);
@@ -542,17 +678,16 @@ export function defineKeyedObject<M, S = DocumentData>(config: KeyedObjectConfig
                     const snap = await tx.get(object);
                     const nowMs = runtime.now();
                     const seq = (snap.exists ? counters(snap).lastSeq : originSeq(nowMs)) + 1;
-                    const item = {
+                    // `set`: nothing live can be at `lastSeq + 1`, so a document there
+                    // is a leftover that must not wedge the key.
+                    tx.set(itemRef(key, seq), {
                         seq,
                         id,
                         msg,
                         attempts: 0,
                         createdAt: new Date(nowMs),
                         [inboxTtl.field]: expiresAt(nowMs),
-                    };
-                    // FIFO: `create`, so a stray document at this seq fails loudly.
-                    if (mode === "fifo") tx.create(itemRef(key, seq), item);
-                    else tx.set(itemRef(key, seq), item);
+                    });
                     if (snap.exists) tx.update(object, { lastSeq: seq, ...objectExpiry(nowMs) });
                     else tx.create(object, { lastSeq: seq, processedSeq: seq - 1, ...objectExpiry(nowMs) });
                     return seq;
@@ -567,7 +702,8 @@ export function defineKeyedObject<M, S = DocumentData>(config: KeyedObjectConfig
             if (wantsKick) {
                 // The newest message's own kick id: already taken in the normal
                 // case (a no-op), created if the original send died before it.
-                const { lastSeq, processedSeq } = counters(await object.get());
+                const snap = await object.get();
+                const { lastSeq, processedSeq } = counters(snap);
                 if (lastSeq > processedSeq) await kick(key, `s${lastSeq}`);
             }
             return "duplicate";
@@ -577,6 +713,7 @@ export function defineKeyedObject<M, S = DocumentData>(config: KeyedObjectConfig
             const startedMs = runtime.now();
             const tally = { processed: 0, deadLettered: 0 };
             let runs = 0;
+            let skips = 0;
             let outcome: DrainOutcome;
             try {
                 outcome = await lease.run(
@@ -585,8 +722,8 @@ export function defineKeyedObject<M, S = DocumentData>(config: KeyedObjectConfig
                         for (;;) {
                             // Only after progress: a slow acquire must not spend the
                             // whole budget, or the re-kicks would never run a message.
-                            const handled = runs + tally.deadLettered;
-                            if (runs >= drainBudget.messages || (handled > 0 && runtime.now() - startedMs >= drainBudget.ms)) {
+                            const progress = runs + tally.deadLettered + skips;
+                            if (runs >= drainBudget.messages || (progress > 0 && runtime.now() - startedMs >= drainBudget.ms)) {
                                 return "budget";
                             }
                             const pick = await pickNext(held, key);
@@ -594,6 +731,7 @@ export function defineKeyedObject<M, S = DocumentData>(config: KeyedObjectConfig
                                 case "empty":
                                     return "idle";
                                 case "skipped":
+                                    skips++;
                                     await notifyExpired(key, pick.seq);
                                     continue;
                                 case "dead":
@@ -614,13 +752,7 @@ export function defineKeyedObject<M, S = DocumentData>(config: KeyedObjectConfig
                     { owner: options.owner },
                 );
             } catch (err) {
-                if (err instanceof LeaseBusyError) {
-                    // The holder normally sees this kick's message. If it is gone
-                    // without releasing (a failed release, a crash whose task is
-                    // never retried), only a kick past the lease expiry remains.
-                    await kick(key, `w${Math.floor(runtime.now() / leaseMs)}`, leaseMs);
-                    return { outcome: "busy", ...tally };
-                }
+                if (err instanceof LeaseBusyError) return { outcome: "busy", ...tally };
                 if (err instanceof LeaseTargetMissingError) return { outcome: "idle", ...tally };
                 if (!(err instanceof LeaseLostError)) throw err;
                 outcome = "lost";
@@ -628,7 +760,8 @@ export function defineKeyedObject<M, S = DocumentData>(config: KeyedObjectConfig
             if (outcome === "idle" || outcome === "budget") {
                 // A send that committed after our last read kicked a drain that
                 // found us busy: whoever releases re-checks and kicks again.
-                const { lastSeq, processedSeq } = counters(await objectRef(key).get());
+                const snap = await objectRef(key).get();
+                const { lastSeq, processedSeq } = counters(snap);
                 if (lastSeq > processedSeq) await kick(key, `n${processedSeq}.${lastSeq}`);
                 else outcome = "idle";
             }

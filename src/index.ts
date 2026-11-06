@@ -28,6 +28,8 @@ export type {
     KeyedObjectKick,
     KeyedObjectMode,
     KeyedObjectRuntime,
+    KeyedSweepOptions,
+    KeyedSweepResult,
     SendOptions,
     SendOutcome,
 } from "./keyed_object";

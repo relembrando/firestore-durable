@@ -171,21 +171,47 @@ function matches(data: Data, filters: [string, string, unknown][]): boolean {
     });
 }
 
+/** Document-name order: segment by segment, like Firestore. */
+function compareNames(a: string, b: string): number {
+    const [x, y] = [a.split("/"), b.split("/")];
+    for (let i = 0; i < Math.min(x.length, y.length); i++) {
+        if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1;
+    }
+    return x.length - y.length;
+}
+
+/** `orderBy("__name__")` with its cursors; other orderings are ignored. */
+type NameRange = { ordered?: boolean; after?: string; before?: string; mask?: string[] };
+
+function masked(path: string, mask: string[] | undefined) {
+    const doc = snap(path);
+    if (!mask) return doc;
+    const data = doc.data() ?? {};
+    const kept = Object.fromEntries(Object.entries(data).filter(([field]) => mask.includes(field)));
+    return { ...doc, data: () => kept, get: (field: string) => kept[field] };
+}
+
 function runQuery(
     collPath: string,
     group: boolean,
     filters: [string, string, unknown][],
     limit: number | null,
+    range: NameRange = {},
 ) {
     const docs: any[] = [];
-    for (const [path, data] of store) {
+    const paths = [...store.keys()];
+    if (range.ordered) paths.sort(compareNames);
+    for (const path of paths) {
+        const data = store.get(path)!;
         const segments = path.split("/");
         const inScope = group
             ? segments.length >= 2 && segments[segments.length - 2] === collPath
             : path.startsWith(`${collPath}/`) &&
               segments.length === collPath.split("/").length + 1;
         if (!inScope || !matches(data, filters)) continue;
-        docs.push(snap(path));
+        if (range.after !== undefined && compareNames(path, range.after) <= 0) continue;
+        if (range.before !== undefined && compareNames(path, range.before) >= 0) continue;
+        docs.push(masked(path, range.mask));
         if (limit !== null && docs.length >= limit) break;
     }
     return { docs, size: docs.length, empty: docs.length === 0 };
@@ -196,15 +222,20 @@ function queryRef(
     group: boolean,
     filters: [string, string, unknown][] = [],
     limit: number | null = null,
+    range: NameRange = {},
 ): any {
     return {
         __query: true,
         doc: (id?: string) => docRef(`${path}/${id ?? `auto_${autoId++}`}`),
         where: (field: string, op: string, val: unknown) =>
-            queryRef(path, group, [...filters, [field, op, val]], limit),
-        orderBy: () => queryRef(path, group, filters, limit),
-        limit: (value: number) => queryRef(path, group, filters, value),
-        get: async () => runQuery(path, group, filters, limit),
+            queryRef(path, group, [...filters, [field, op, val]], limit, range),
+        orderBy: (field?: unknown) =>
+            queryRef(path, group, filters, limit, field === "__name__" ? { ...range, ordered: true } : range),
+        startAfter: (name: string) => queryRef(path, group, filters, limit, { ...range, after: name }),
+        endBefore: (name: string) => queryRef(path, group, filters, limit, { ...range, before: name }),
+        select: (...mask: string[]) => queryRef(path, group, filters, limit, { ...range, mask }),
+        limit: (value: number) => queryRef(path, group, filters, value, range),
+        get: async () => runQuery(path, group, filters, limit, range),
     };
 }
 
