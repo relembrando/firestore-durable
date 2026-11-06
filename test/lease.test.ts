@@ -150,6 +150,60 @@ describe("defineLease", () => {
             });
             expect(store.get("leases/k")).toEqual({ holder: null, owner: null, until: 0 });
         });
+
+        // A legacy writer using `update` or merge keeps the modern fields of the
+        // expired lease it acquired over, so the document decodes as a modern lease.
+        describe("a legacy holder over an expired modern lease", () => {
+            const stale = { holder: "crashed", epoch: 0, token: "stale-token", expiresAtMs: 0 };
+
+            it("is busy while the legacy holder is live, and writes nothing", async () => {
+                const doc = { ...stale, expiresAtMs: nowMs - 1, owner: "old-op", until: nowMs + TTL };
+                store.set("leases/k", doc);
+                const fn = jest.fn();
+
+                await expect(lease().run("k", fn)).rejects.toMatchObject({ name: "LeaseBusyError", holder: "old-op" });
+
+                expect(fn).not.toHaveBeenCalled();
+                expect(store.get("leases/k")).toEqual(doc);
+            });
+
+            it("is busy in field mode too", async () => {
+                store.set("stories/k", { title: "t", lease: { ...stale, expiresAtMs: nowMs - 1, owner: "old-op", until: nowMs + TTL } });
+                const inField = defineLease({
+                    db: fakeDb,
+                    at: (k: string) => fakeDb.doc(`stories/${k}`),
+                    field: "lease",
+                    ttlMs: TTL,
+                    legacy,
+                    runtime: { now: () => nowMs, newToken: () => `t${tokens++}`, sleep: async () => undefined },
+                });
+
+                await expect(inField.run("k", jest.fn())).rejects.toMatchObject({ holder: "old-op" });
+            });
+
+            it("acquires once the legacy holder expired too", async () => {
+                store.set("leases/k", { ...stale, expiresAtMs: nowMs - 1, owner: "old-op", until: nowMs - 1 });
+
+                await expect(lease().run("k", async () => "ok")).resolves.toBe("ok");
+            });
+
+            it("acquires over the crashed holder's own mirrored legacy fields, which expire with it", async () => {
+                await lease().run("k", async () => {
+                    // No release: this holder crashes. Its mirror carries the same expiry.
+                    store.set("crash/k", store.get("leases/k")!);
+                });
+                store.set("leases/k", store.get("crash/k")!);
+                nowMs += TTL;
+
+                await expect(lease().run("k", async () => "ok")).resolves.toBe("ok");
+            });
+
+            it("still lets a retry take over its own live lease, whose mirror reads as live", async () => {
+                store.set("leases/k", { holder: "task-1", epoch: 1, token: "t", expiresAtMs: nowMs + TTL, owner: "task-1", until: nowMs + TTL });
+
+                await expect(lease().run("k", async () => "ok", { owner: { id: "task-1", epoch: 2 } })).resolves.toBe("ok");
+            });
+        });
     });
 
     describe("transaction contention", () => {

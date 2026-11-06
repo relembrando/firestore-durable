@@ -202,6 +202,64 @@ describe("defineLease against the Firestore emulator", () => {
         expect((await story.get()).data()).toEqual({ title: "Infância em Minas", n: CONTENDERS, processingLease: null });
     });
 
+    describe("a legacy writer that acquires with update, keeping the modern fields of an expired lease", () => {
+        const ref = db.doc("leases/mixed");
+        const modern = defineLease({
+            db,
+            at: () => ref,
+            ttlMs: TTL,
+            legacy: {
+                read: (raw) => {
+                    const d = raw as { owner?: unknown; until?: unknown } | undefined;
+                    return typeof d?.owner === "string" && typeof d?.until === "number"
+                        ? { holder: d.owner, expiresAtMs: d.until }
+                        : undefined;
+                },
+                write: (state) => ({ owner: state?.holder ?? null, until: state?.expiresAtMs ?? 0 }),
+            },
+        });
+        const crashed = () => ref.set({ holder: "crashed", epoch: 0, token: "stale", expiresAtMs: Date.now() - 1, owner: "crashed", until: 0 });
+        const legacyAcquire = () =>
+            db.runTransaction(async (tx) => {
+                const until = (await tx.get(ref)).get("until") as number | undefined;
+                if ((until ?? 0) > Date.now()) return false;
+                tx.update(ref, { owner: "old-op", until: Date.now() + TTL });
+                return true;
+            });
+
+        it("refuses a modern acquire while that legacy holder is live", async () => {
+            await crashed();
+            expect(await legacyAcquire()).toBe(true);
+            const fn = jest.fn();
+
+            await expect(modern.run("k", fn)).rejects.toMatchObject({ name: "LeaseBusyError", holder: "old-op" });
+
+            expect(fn).not.toHaveBeenCalled();
+        });
+
+        it("never has both inside when they race", async () => {
+            for (const modernDelayMs of [0, 2, 5, 10, 20, 40]) {
+                await crashed();
+                let modernHeld = false;
+                let mayRelease!: () => void;
+                const released = new Promise<void>((resolve) => (mayRelease = resolve));
+                const modernRun = sleep(modernDelayMs).then(() =>
+                    modern.run("k", async () => {
+                        modernHeld = true;
+                        await released;
+                    }).catch(() => undefined),
+                );
+                const legacyHeld = await legacyAcquire();
+                // A modern acquire that won reaches its body well before this.
+                await sleep(modernDelayMs + 150);
+
+                expect(Number(modernHeld) + Number(legacyHeld)).toBeLessThanOrEqual(1);
+                mayRelease();
+                await modernRun;
+            }
+        });
+    });
+
     // Verify the verifier: through the same probe, a lease that lapses as soon
     // as it is written must show overlap, or `toBe(1)` above proves nothing.
     // Staggered starts skip the simultaneous-acquire deadlock, which the
