@@ -9,10 +9,12 @@ handlers run at least once, every commit is fenced, and re-running is the repair
 There is no extra server to run, no step history to replay and no determinism
 requirement on your code.
 
-> **Early release.** The API can still change and nothing is on npm yet. The code
-> has a full test suite, including a real Firestore emulator, and most of it has run in a
-> staging environment, but it has not run in production yet. Use it with that in
-> mind, and read [Guarantees and non-guarantees](#guarantees-and-non-guarantees).
+> **Early release.** The API can still change and nothing is on npm yet. Every
+> primitive has run in production at Relembrando since November 2026, but that is
+> one application at modest volume: it has not yet been tested by heavy traffic or by
+> other people's use. The code has a full test suite, including a real Firestore
+> emulator. Use it with caution, and read
+> [Guarantees and non-guarantees](#guarantees-and-non-guarantees).
 
 ## Why
 
@@ -50,13 +52,13 @@ is a replay engine behind Vercel Workflow DevKit rather than a set of primitives
 
 ## Install
 
-Not on npm yet. It has no runtime dependencies; `firebase-admin` is a peer
+Not on npm yet. To try it, copy `src/` into your project. It has no runtime dependencies; `firebase-admin` is a peer
 dependency used for types only, and you pass in the Firestore instance. Tested on
 Node 24 and `firebase-admin` 14 only.
 
 ## Primitives
 
-Runnable-shaped versions of these, wired into Cloud Functions, are in
+Fuller versions of these, wired into Cloud Functions, are in
 [examples/](examples/). The full contract of each primitive is in its source header.
 
 ### `defineLease`
@@ -117,7 +119,20 @@ shapes of "exactly once":
 | `applyOnce(id, fn(tx))` | The whole effect is Firestore writes in one transaction | Exactly once: marker and effect commit together |
 | `runAndRecord(id, fn)` | The effect calls other systems, and is idempotent | At least once: the marker only skips later redeliveries |
 
-`ttl.ms` must outlast the provider's redelivery window.
+```ts
+const events = defineLedger({
+    db,
+    at: (id) => db.collection("webhookEvents").doc(id),
+    ttl: { field: "expiresAt", ms: 7 * DAY_MS }, // must outlast the provider's redelivery window
+});
+
+await events.applyOnce(event.id, async (tx) => {
+    tx.set(userRef, { credits: FieldValue.increment(1) }, { merge: true });
+}); // { status: "applied", value } | { status: "duplicate" }
+```
+
+With `runAndRecord`, a throw from `fn` leaves no marker, so a webhook that answers
+5xx gets the redelivery.
 
 ### `defineOutbox`
 
@@ -126,19 +141,32 @@ A dispatcher delivers it later, with retries, and no transaction ever waits on t
 network.
 
 ```ts
+const outbox = defineOutbox({
+    db,
+    at: (id) => db.collection("emailOutbox").doc(id),
+    items: () => db.collection("emailOutbox"),
+    leaseMs: 120_000, // must outlive deliver()
+    backoff: { baseMs: 30_000, maxMs: 3_600_000 },
+    ttl: { field: "expiresAt", ms: 7 * DAY_MS },
+    deleteField: () => FieldValue.delete(),
+});
+
 await db.runTransaction(async (tx) => {
     tx.create(orderRef, order);
     outbox.put(tx, `confirm-${orderId}`, { to: email });
 });
 
-await outbox.dispatch(id, {
-    claim: async ({ data, expired }) =>           // inside the claim transaction
-        expired ? { kind: "settle", state: "expired" } : { kind: "claim", value: data.to },
-    deliver: async (to) =>                        // outside any transaction
-        (await send(to, id)) ? { kind: "settle", state: "sent" } : { kind: "retry" },
-});
+async function dispatch(id: string): Promise<void> {
+    await outbox.dispatch(id, {
+        claim: async ({ data, expired }) =>   // inside the claim transaction
+            expired ? { kind: "settle", state: "expired" } : { kind: "claim", value: data.to },
+        deliver: async (to) =>                // outside any transaction
+            (await send(to, id)) ? { kind: "settle", state: "sent" } : { kind: "retry" },
+    });
+}
 
-await outbox.sweep({ limit: 100, concurrency: 5 }, dispatchById); // on a schedule
+await dispatch(id);                                   // right after the commit
+await outbox.sweep({ limit: 100, concurrency: 5 }, dispatch); // on a schedule
 ```
 
 Outcomes are `retry`, `settle`, `park` and `drop`. The lease is `nextAttemptAt`
